@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operations Agent</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #101214; color: #e2e5e9; }
+    main { max-width: 900px; min-height: 100dvh; margin: auto; padding: 28px 24px; }
+    header { padding-bottom: 16px; border-bottom: 1px solid #353a40; }
+    h1 { font: inherit; font-weight: bold; margin: 0; }
+    .hint { color: #9ba4af; font-size: 13px; margin: 4px 0 0; }
+    #history { padding-top: 20px; }
+    .message { margin: 0 0 24px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .user, label { color: #8cd8b1; }
+    .error { color: #ffb1a8; }
+    form { display: flex; align-items: baseline; gap: 12px; }
+    input { min-width: 0; flex: 1; font: inherit; color: inherit; background: transparent;
+            border: 0; border-bottom: 1px solid #353a40; padding: 8px 0; border-radius: 0; }
+    input:focus { outline: none; border-color: #8cd8b1; }
+    button { font: inherit; background: transparent; color: #9ba4af; border: 1px solid #353a40;
+             border-radius: 4px; padding: 4px 10px; cursor: pointer; }
+    button:focus-visible { outline: 2px solid #8cd8b1; }
+    button:disabled { cursor: wait; opacity: .5; }
+    #status { min-height: 24px; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Operations Agent</h1>
+      <p class="hint">Enter to send · Each request is independent</p>
+    </header>
+    <section id="history" role="log" aria-label="Conversation" aria-live="polite"></section>
+    <form id="chat">
+      <label for="message" aria-label="Your message">&gt;</label>
+      <input id="message" name="message" placeholder="Ask about your systems…" autocomplete="off" required autofocus>
+      <button type="submit">Send</button>
+    </form>
+    <p id="status" class="hint" role="status"></p>
+  </main>
+  <script>
+    const form = document.querySelector('#chat');
+    const input = document.querySelector('#message');
+    const button = form.querySelector('button');
+    const history = document.querySelector('#history');
+    const status = document.querySelector('#status');
+
+    function appendMessage(text, role) {
+      const line = document.createElement('p');
+      line.className = `message ${role}`;
+      line.textContent = role === 'user' ? `> ${text}` : text;
+      history.append(line);
+      form.scrollIntoView({ block: 'end' });
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = input.value.trim();
+      if (!message || input.disabled) return;
+      appendMessage(message, 'user');
+      input.value = '';
+      input.disabled = button.disabled = true;
+      status.textContent = 'Working…';
+      try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
+        }
+        appendMessage(data.response, 'assistant');
+      } catch (error) {
+        appendMessage(`Error: ${error.message}`, 'error');
+      } finally {
+        input.disabled = button.disabled = false;
+        status.textContent = '';
+        input.focus();
+      }
+    });
+  </script>
+</body>
+</html>
