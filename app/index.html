@@ -13,9 +13,20 @@
     h1 { font: inherit; font-weight: bold; margin: 0; }
     .hint { color: #9ba4af; font-size: 13px; margin: 4px 0 0; }
     #history { padding-top: 20px; }
-    .message { margin: 0 0 24px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message { margin: 0 0 24px; overflow-wrap: anywhere; }
+    .message.user { white-space: pre-wrap; }
     .user, label { color: #8cd8b1; }
-    .error { color: #ffb1a8; }
+    .error { color: #ffb1a8; white-space: pre-wrap; }
+    .message.assistant :first-child { margin-top: 0; }
+    .message.assistant :last-child { margin-bottom: 0; }
+    .message.assistant p { margin: .6em 0; }
+    .message.assistant ul, .message.assistant ol { margin: .6em 0; padding-left: 1.5em; }
+    .message.assistant pre { margin: .8em 0; padding: 12px; background: #1a1d21; border-radius: 4px; overflow-x: auto; }
+    .message.assistant code { font: inherit; background: #1a1d21; padding: 2px 5px; border-radius: 3px; }
+    .message.assistant pre code { background: transparent; padding: 0; }
+    .message.assistant a { color: #8cd8b1; }
+    .message.assistant blockquote { margin: .8em 0; padding-left: 1em; border-left: 3px solid #353a40; color: #9ba4af; }
+    #chat[hidden] { display: none; }
     form { display: flex; align-items: baseline; gap: 12px; }
     input { min-width: 0; flex: 1; font: inherit; color: inherit; background: transparent;
             border: 0; border-bottom: 1px solid #353a40; padding: 8px 0; border-radius: 0; }
@@ -41,6 +52,8 @@
     </form>
     <p id="status" class="hint" role="status"></p>
   </main>
+  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
   <script>
     const form = document.querySelector('#chat');
     const input = document.querySelector('#message');
@@ -48,10 +61,21 @@
     const history = document.querySelector('#history');
     const status = document.querySelector('#status');
 
+    function renderMarkdown(text) {
+      const html = marked.parse(text, { gfm: true, breaks: true });
+      return DOMPurify.sanitize(html);
+    }
+
     function appendMessage(text, role) {
-      const line = document.createElement('p');
+      const line = document.createElement('div');
       line.className = `message ${role}`;
-      line.textContent = role === 'user' ? `> ${text}` : text;
+      if (role === 'assistant') {
+        line.innerHTML = renderMarkdown(text);
+      } else if (role === 'user') {
+        line.textContent = `> ${text}`;
+      } else {
+        line.textContent = text;
+      }
       history.append(line);
       form.scrollIntoView({ block: 'end' });
     }
@@ -59,10 +83,10 @@
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const message = input.value.trim();
-      if (!message || input.disabled) return;
+      if (!message || form.hidden) return;
       appendMessage(message, 'user');
       input.value = '';
-      input.disabled = button.disabled = true;
+      form.hidden = true;
       status.textContent = 'Working…';
       try {
         const response = await fetch('/api/chat', {
@@ -78,7 +102,7 @@
       } catch (error) {
         appendMessage(`Error: ${error.message}`, 'error');
       } finally {
-        input.disabled = button.disabled = false;
+        form.hidden = false;
         status.textContent = '';
         input.focus();
       }
