@@ -8,7 +8,12 @@
     :root { color-scheme: dark; font: 16px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
     * { box-sizing: border-box; }
     body { margin: 0; background: #101214; color: #e2e5e9; }
-    main { max-width: 900px; min-height: 100dvh; margin: auto; padding: 28px 24px; }
+    main { max-width: 1100px; min-height: 100dvh; margin: auto; padding: 28px 24px; }
+    .layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 24px; }
+    aside { border-right: 1px solid #353a40; padding-right: 16px; }
+    #sessions button { display: block; width: 100%; text-align: left; margin-top: 8px; overflow-wrap: anywhere; }
+    #sessions button[aria-current="true"] { color: #8cd8b1; border-color: #8cd8b1; }
+    @media (max-width: 600px) { .layout { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #353a40; padding-bottom: 12px; } }
     header { padding-bottom: 16px; border-bottom: 1px solid #353a40; }
     h1 { font: inherit; font-weight: bold; margin: 0; }
     .hint { color: #9ba4af; font-size: 13px; margin: 4px 0 0; }
@@ -39,10 +44,16 @@
   </style>
 </head>
 <body>
-  <main>
+  <main class="layout">
+    <aside aria-label="Conversations">
+      <h1>Conversations</h1>
+      <button id="new-session" type="button">+ New</button>
+      <nav id="sessions" aria-label="Conversation selector"></nav>
+    </aside>
+    <div>
     <header>
       <h1>Operations Agent</h1>
-      <p class="hint">Enter to send · Each request is independent</p>
+      <p class="hint">Enter to send · Conversation context is retained</p>
     </header>
     <section id="history" role="log" aria-label="Conversation" aria-live="polite"></section>
     <form id="chat">
@@ -51,6 +62,7 @@
       <button type="submit">Send</button>
     </form>
     <p id="status" class="hint" role="status"></p>
+    </div>
   </main>
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
@@ -60,6 +72,92 @@
     const button = form.querySelector('button');
     const history = document.querySelector('#history');
     const status = document.querySelector('#status');
+
+    const sessionList = document.querySelector('#sessions');
+    const newButton = document.querySelector('#new-session');
+    let selectedSession = null;
+    let busy = false;
+
+    async function api(path, options) {
+      const response = await fetch(path, options);
+      const data = await response.json();
+      if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
+      return data;
+    }
+
+    function setBusy(value) {
+      busy = value;
+      form.hidden = value || !selectedSession;
+      newButton.disabled = value;
+      for (const entry of sessionList.querySelectorAll('button')) entry.disabled = value;
+    }
+
+    async function refreshSessions() {
+      const sessions = await api('/api/sessions');
+      sessionList.replaceChildren();
+      for (const session of sessions) {
+        const entry = document.createElement('button');
+        entry.textContent = session.title;
+        entry.setAttribute('aria-current', String(session.session_id === selectedSession));
+        entry.disabled = busy;
+        entry.addEventListener('click', () => selectSession(session.session_id));
+        sessionList.append(entry);
+      }
+      return sessions;
+    }
+
+    async function selectSession(id) {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const session = await api(`/api/sessions/${id}`);
+        selectedSession = id;
+        history.replaceChildren();
+        input.value = '';
+        for (const message of session.messages) appendMessage(message.content, message.role);
+        await refreshSessions();
+        status.textContent = '';
+      } catch (error) {
+        status.textContent = `Error: ${error.message}`;
+      } finally {
+        setBusy(false);
+        input.focus();
+      }
+    }
+
+    async function newSession() {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const session = await api('/api/sessions', { method: 'POST' });
+        selectedSession = session.session_id;
+        history.replaceChildren();
+        input.value = '';
+        await refreshSessions();
+        status.textContent = '';
+      } catch (error) {
+        status.textContent = `Error: ${error.message}`;
+      } finally {
+        setBusy(false);
+        input.focus();
+      }
+    }
+
+    newButton.addEventListener('click', newSession);
+
+    async function initialize() {
+      setBusy(true);
+      try {
+        const sessions = await refreshSessions();
+        setBusy(false);
+        if (sessions.length) await selectSession(sessions[0].session_id);
+        else await newSession();
+      } catch (error) {
+        status.textContent = `Error: ${error.message}`;
+        setBusy(false);
+      }
+    }
+    initialize();
 
     function renderMarkdown(text) {
       const html = marked.parse(text, { gfm: true, breaks: true });
@@ -83,13 +181,14 @@
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const message = input.value.trim();
-      if (!message || form.hidden) return;
+      if (!message || busy || !selectedSession) return;
+      const sessionId = selectedSession;
       appendMessage(message, 'user');
       input.value = '';
-      form.hidden = true;
+      setBusy(true);
       status.textContent = 'Working…';
       try {
-        const response = await fetch('/api/chat', {
+        const response = await fetch(`/api/sessions/${sessionId}/messages`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message }),
@@ -99,10 +198,11 @@
           throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
         }
         appendMessage(data.response, 'assistant');
+        await refreshSessions();
       } catch (error) {
         appendMessage(`Error: ${error.message}`, 'error');
       } finally {
-        form.hidden = false;
+        setBusy(false);
         status.textContent = '';
         input.focus();
       }

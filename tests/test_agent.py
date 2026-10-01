@@ -69,7 +69,8 @@ def test_final_answer_without_tools(model, config, mcp_boundary):
     exposed = model.call_args.kwargs["tools"]
     discovered = [(server, tool) for server, session in mcp_boundary.sessions.items()
                   for tool in session.list_tools.return_value.tools]
-    assert len(exposed) == len(discovered)
+    assert len(exposed) == len(discovered) + 1
+    assert any(tool.name == "request_user_input" for tool in exposed)
     for server, source in discovered:
         name = exposed_name(exposed, server, source.name)
         actual = next(tool for tool in exposed if tool.name == name)
@@ -134,10 +135,21 @@ def test_turn_limit(model, config):
     assert model.await_count == MAX_TURNS
 
 
-def test_missing_information_asks_without_calling_tools(model, config, mcp_boundary):
-    model.return_value = answer("Which namespace should I check?")
-    result = asyncio.run(run_agent("How many pods are there?", config))
-    assert result == NO_LIVE_DATA and model.await_count == 1
+def test_missing_information_asks_without_calling_tools(model, config, mcp_boundary, monkeypatch):
+    invoke = agent_module.request_user_input.on_invoke_tool
+
+    async def invoke_tool(context, arguments):
+        return await invoke(context, arguments)
+
+    requested = AsyncMock(side_effect=invoke_tool)
+    monkeypatch.setattr(agent_module.request_user_input, "on_invoke_tool", requested)
+    question = "The namespace name is needed to continue."
+    model.return_value = call("request_user_input", {"question": question})
+    result = asyncio.run(run_agent("How many pods are in the namespace?", config))
+    assert result == question and result != NO_LIVE_DATA
+    requested.assert_awaited_once()
+    assert json.loads(requested.call_args.args[1]) == {"question": question}
+    assert model.await_count == 1
     for session in mcp_boundary.sessions.values():
         session.call_tool.assert_not_awaited()
     for tool in model.call_args.kwargs["tools"]:
@@ -290,9 +302,10 @@ def test_unknown_and_mixed_requests_require_tools(message):
 def test_no_tools_returns_controlled_response(model, config):
     from dataclasses import replace
 
+    model.return_value = answer("There are 2 pods in pepe.")
     result = asyncio.run(run_agent("How many pods are in pepe?", replace(config, mcp_servers=())))
     assert result == NO_LIVE_DATA
-    model.assert_not_awaited()
+    assert model.await_count == 1
 
 
 def test_provider_rejecting_required_tool_choice_can_answer_with_auto(model, config, mcp_boundary):
@@ -432,3 +445,138 @@ def test_workflow_distinctions_remain_in_single_prompt(model, config):
     for term in ("workflow job templates", "workflow jobs", "workflow executions"):
         assert term in prompt
     assert "clarification question" in prompt
+
+
+@pytest.mark.parametrize("question", [
+    "Namespace needed", "Indica el espacio de nombres.",
+    "Choose a namespace:\nproduction / staging", "Please provide " + "x" * 300,
+])
+def test_request_user_input_acceptance_is_independent_of_wording(model, config, mcp_boundary, question):
+    model.return_value = call("request_user_input", {"question": question})
+    assert asyncio.run(run_agent("How many pods are in the namespace?", config)) == question
+    assert model.await_count == 1  # The SDK stops at the local tool.
+    for session in mcp_boundary.sessions.values():
+        session.call_tool.assert_not_awaited()
+
+
+def test_complete_namespace_calls_mcp_without_clarification(model, config, mcp_boundary, monkeypatch):
+    invoke = agent_module.request_user_input.on_invoke_tool
+
+    async def invoke_tool(context, arguments):
+        return await invoke(context, arguments)
+
+    requested = AsyncMock(side_effect=invoke_tool)
+    monkeypatch.setattr(agent_module.request_user_input, "on_invoke_tool", requested)
+
+    def respond(**kwargs):
+        if model.await_count == 1:
+            return call(exposed_name(kwargs["tools"], "openshift", "get_pod_count"),
+                        {"namespace": "openshift-ingress"})
+        return answer("The tool reports 3 pods.")
+
+    model.side_effect = respond
+    result = asyncio.run(run_agent("How many pods are in namespace openshift-ingress?", config))
+    assert result != NO_LIVE_DATA
+    requested.assert_not_awaited()
+    mcp_boundary.sessions["openshift"].call_tool.assert_awaited_once_with(
+        "get_pod_count", {"namespace": "openshift-ingress"}
+    )
+
+
+def test_question_prose_without_local_tool_is_rejected(model, config, mcp_boundary):
+    model.return_value = answer("Which namespace should I check?")
+    assert asyncio.run(run_agent("How many pods are in the namespace?", config)) == NO_LIVE_DATA
+    for session in mcp_boundary.sessions.values():
+        session.call_tool.assert_not_awaited()
+
+
+def test_request_user_input_is_allowed_after_failed_mcp_call(model, config, mcp_boundary):
+    mcp_boundary.tool_results["openshift"] = RuntimeError("Query failed")
+
+    def respond(**kwargs):
+        tool_call = call(exposed_name(kwargs["tools"], "openshift", "get_pod_count"),
+                         {"namespace": "openshift-ingress"})
+        tool_call.output.extend(call("request_user_input", {"question": "Provide more details."}).output)
+        return tool_call
+
+    model.side_effect = respond
+    assert asyncio.run(run_agent("Count pods in openshift-ingress", config)) == "Provide more details."
+    assert model.await_count == 1
+    mcp_boundary.sessions["openshift"].call_tool.assert_awaited_once()
+
+
+
+def test_failed_argument_then_two_successful_calls_allows_final_answer(model, config, mcp_boundary, caplog):
+    caplog.set_level(logging.INFO, logger="app")
+    final = "Both namespaces have 3 pods according to the tool results."
+
+    def respond(**kwargs):
+        if model.await_count == 4:
+            outputs = [item for item in kwargs["input"]
+                       if isinstance(item, dict) and item.get("type") == "function_call_output"]
+            assert len(outputs) == 3
+            assert "could not be retrieved" in outputs[0]["output"]
+            assert [json.loads(item["output"][0]["text"])["namespace"] for item in outputs[1:]] == [
+                "openshift-ingress", "openshift-mcp",
+            ]
+            return answer(final)
+        arguments = [{}, {"namespace": "openshift-ingress"}, {"namespace": "openshift-mcp"}]
+        response = call(exposed_name(kwargs["tools"], "openshift", "get_pod_count"),
+                        arguments[model.await_count - 1])
+        response.output[0].call_id = f"attempt_{model.await_count}"
+        return response
+
+    model.side_effect = respond
+    assert asyncio.run(run_agent("Count pods in openshift-ingress and openshift-mcp", config)) == final
+    assert mcp_boundary.sessions["openshift"].call_tool.await_count == 2
+    assert [args.args[1] for args in mcp_boundary.sessions["openshift"].call_tool.await_args_list] == [
+        {"namespace": "openshift-ingress"}, {"namespace": "openshift-mcp"},
+    ]
+    assert "MCP calls attempted=3 succeeded=2 failed=1" in caplog.text
+    assert "status=failed" in caplog.text
+
+
+def test_partial_mcp_success_preserves_model_answer(model, config, mcp_boundary, caplog):
+    caplog.set_level(logging.INFO, logger="app")
+    mcp_boundary.tool_results["aap"] = RuntimeError("Authorization: Bearer test-secret")
+    final = "There are 3 pods. The workflow status could not be retrieved."
+
+    def respond(**kwargs):
+        if model.await_count == 1:
+            return call(exposed_name(kwargs["tools"], "openshift", "get_pod_count"),
+                        {"namespace": "openshift-ingress"})
+        if model.await_count == 2:
+            return call(exposed_name(kwargs["tools"], "aap", "get_workflow_status"),
+                        {"workflow_id": "42"})
+        return answer(final)
+
+    model.side_effect = respond
+    assert asyncio.run(run_agent("Count pods and check workflow status", config)) == final
+    mcp_boundary.sessions["openshift"].call_tool.assert_awaited_once()
+    mcp_boundary.sessions["aap"].call_tool.assert_awaited_once()
+    assert "MCP calls attempted=2 succeeded=1 failed=1" in caplog.text
+    assert "status=failed" in caplog.text
+    assert "test-secret" not in caplog.text
+
+
+def test_multiple_failed_mcp_calls_still_reject_factual_answer(model, config, mcp_boundary, caplog):
+    caplog.set_level(logging.INFO, logger="app")
+    for server in ("openshift", "aap"):
+        mcp_boundary.tool_results[server] = CallToolResult(
+            isError=True, content=[TextContent(type="text", text="Query failed")],
+        )
+
+    def respond(**kwargs):
+        if model.await_count == 1:
+            return call(exposed_name(kwargs["tools"], "openshift", "get_pod_count"),
+                        {"namespace": "openshift-ingress"})
+        if model.await_count == 2:
+            return call(exposed_name(kwargs["tools"], "aap", "get_workflow_status"),
+                        {"workflow_id": "42"})
+        return answer("There are 3 pods and the workflow succeeded.")
+
+    model.side_effect = respond
+    assert asyncio.run(run_agent("Count pods and check workflow status", config)) == NO_LIVE_DATA
+    mcp_boundary.sessions["openshift"].call_tool.assert_awaited_once()
+    mcp_boundary.sessions["aap"].call_tool.assert_awaited_once()
+    assert "MCP calls attempted=2 succeeded=0 failed=2" in caplog.text
