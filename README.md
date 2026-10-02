@@ -28,3 +28,9 @@ For a diagnostic-only tool comparison, load `.env` as for `make run-app` and run
 failure). This command logs only tool counts, names, origins, and schema shapes;
 it does not install a tool filter in the application. Its default request is a
 read-only pod count; `--message` can supply another diagnostic request.
+
+Use `/procedure <request>` to retrieve the top matching article through the existing
+ITSM MCP/RAG tools. A Markdown `## Procedure` section identifies a procedure
+candidate. This path only retrieves articles; it does not compile or execute steps.
+Procedure requests stay in the selected SDK chat session. Other messages continue
+using OperationsAgent directly.

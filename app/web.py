@@ -12,6 +12,7 @@ from app.agent import run_agent
 from app.config import load_config
 from app.diagnostics import configure_logging, log_failure
 from app.mcp import MCPConnectionError
+from app.procedures import ProcedureRetrievalError, procedure_query, run_procedure
 from app.sessions import Conversation, timestamp, visible_messages
 
 
@@ -47,13 +48,19 @@ async def chat(request: ChatRequest) -> dict[str, str]:
 
 async def send_message(request: ChatRequest, session=None) -> dict[str, str]:
     try:
+        query = procedure_query(request.message)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
+    try:
         config = load_config()
     except ValueError:
         raise HTTPException(503, "Check the server's environment configuration.") from None
     try:
-        response = (await run_agent(request.message, config) if session is None
-                    else await run_agent(request.message, config, session=session))
-    except MCPConnectionError as error:
+        runner = run_agent if query is None else run_procedure
+        message = request.message if query is None else query
+        response = (await runner(message, config) if session is None
+                    else await runner(message, config, session=session))
+    except (MCPConnectionError, ProcedureRetrievalError) as error:
         # This application exception contains only server names and error categories.
         raise HTTPException(502, str(error)) from None
     except MaxTurnsExceeded:

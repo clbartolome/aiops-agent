@@ -21,6 +21,8 @@
     .message { margin: 0 0 24px; overflow-wrap: anywhere; }
     .message.user { white-space: pre-wrap; }
     .user, label { color: #8cd8b1; }
+    .message.user.procedure, input.procedure { color: #c5a3ee; }
+    input.procedure:focus { border-color: #c5a3ee; }
     .error { color: #ffb1a8; white-space: pre-wrap; }
     .message.assistant :first-child { margin-top: 0; }
     .message.assistant :last-child { margin-bottom: 0; }
@@ -53,7 +55,7 @@
     <div>
     <header>
       <h1>Operations Agent</h1>
-      <p class="hint">Enter to send · Conversation context is retained</p>
+      <p class="hint">Enter to send · Conversation context is retained · /procedure to find a procedure</p>
     </header>
     <section id="history" role="log" aria-label="Conversation" aria-live="polite"></section>
     <form id="chat">
@@ -85,7 +87,16 @@
       return data;
     }
 
+    function isProcedure(text) {
+      return text.trim().split(/\s+/, 1)[0] === '/procedure';
+    }
+
+    input.addEventListener('input', () => {
+      input.classList.toggle('procedure', isProcedure(input.value));
+    });
+
     function setBusy(value) {
+      input.classList.toggle('procedure', isProcedure(input.value));
       busy = value;
       form.hidden = value || !selectedSession;
       newButton.disabled = value;
@@ -167,6 +178,7 @@
     function appendMessage(text, role) {
       const line = document.createElement('div');
       line.className = `message ${role}`;
+      if (role === 'user' && isProcedure(text)) line.classList.add('procedure');
       if (role === 'assistant') {
         line.innerHTML = renderMarkdown(text);
       } else if (role === 'user') {
