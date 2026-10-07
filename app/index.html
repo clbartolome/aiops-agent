@@ -25,6 +25,7 @@
     input.procedure:focus { border-color: #c5a3ee; }
     .error { color: #ffb1a8; white-space: pre-wrap; }
     .message.assistant :first-child { margin-top: 0; }
+    .message.assistant.procedure > :first-child { color: #c5a3ee; }
     .message.assistant :last-child { margin-bottom: 0; }
     .message.assistant p { margin: .6em 0; }
     .message.assistant ul, .message.assistant ol { margin: .6em 0; padding-left: 1.5em; }
@@ -55,7 +56,7 @@
     <div>
     <header>
       <h1>Operations Agent</h1>
-      <p class="hint">Enter to send · Conversation context is retained · /procedure to find a procedure</p>
+      <p class="hint">Enter to send · /procedure to run a procedure · /cancel to cancel it</p>
     </header>
     <section id="history" role="log" aria-label="Conversation" aria-live="polite"></section>
     <form id="chat">
@@ -179,6 +180,7 @@
       const line = document.createElement('div');
       line.className = `message ${role}`;
       if (role === 'user' && isProcedure(text)) line.classList.add('procedure');
+      if (role === 'assistant' && text.startsWith('PROCEDURE · ')) line.classList.add('procedure');
       if (role === 'assistant') {
         line.innerHTML = renderMarkdown(text);
       } else if (role === 'user') {

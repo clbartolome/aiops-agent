@@ -7,8 +7,13 @@ import pytest
 from agents.mcp import MCPServerStreamableHttp
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
-from app import web
-from app.procedures import has_procedure_section, procedure_query
+from app import web, procedures
+from app.procedure_models import ProcedureDefinition
+from app.procedure_compiler import ProcedureCompilationError
+from app.procedure_binding import ProcedureBindingError
+from app.procedure_binding_models import BoundProcedureDefinition, BoundProcedureStep, ToolArgumentBinding
+from test_procedure_compiler import MARKDOWN, extraction, semantic_payload
+from app.procedures import has_procedure_section, procedure_query, bind_current_tools as real_binding_discovery
 from test_web import request
 
 
@@ -51,6 +56,14 @@ def kb(monkeypatch, config):
         )
 
     monkeypatch.setattr(MCPServerStreamableHttp, 'connect', connect)
+    definition = ProcedureDefinition.model_validate(extraction())
+    state.compile = AsyncMock(return_value=definition)
+    monkeypatch.setattr(procedures, 'compile_procedure', state.compile)
+    state.bind = AsyncMock(return_value=BoundProcedureDefinition(procedure=definition, steps=[
+        BoundProcedureStep(step_id=step.id, mcp_server=step.system, tool_name=f'mcp_aap__users_{step.action}',
+                           argument_bindings=[ToolArgumentBinding(procedure_argument=arg.name, tool_argument=arg.name)
+                                              for arg in step.arguments]) for step in definition.steps]))
+    monkeypatch.setattr(procedures, 'bind_current_tools', state.bind)
     monkeypatch.setattr(web, 'load_config', lambda: config)
     state.direct = AsyncMock(return_value='Direct answer')
     monkeypatch.setattr(web, 'run_agent', state.direct)
@@ -77,8 +90,10 @@ def test_procedure_retrieves_best_article_using_itsm_mcp(kb, structured):
     kb.structured = structured
     response = request('POST', '/api/chat', json={'message': '  /procedure create operations user  '})
     assert response.status_code == 200
-    assert 'Procedure candidate found' in response.json()['response']
-    assert kb.article['description'] in response.json()['response']
+    assert 'Procedure found: Create operations user' in response.json()['response']
+    assert 'compiled, validated, and bound successfully' in response.json()['response']
+    assert kb.compile.await_args.args[0].startswith('# Create operations user')
+    assert kb.article['description'] not in response.json()['response']
     assert 'No steps have been executed' in response.json()['response']
     kb.direct.assert_not_awaited()
     assert [server.name for server in kb.servers] == ['itsm']
@@ -168,3 +183,143 @@ def test_only_actual_procedure_heading_is_recognized(markdown, expected):
 def test_query_removes_only_command_and_surrounding_whitespace():
     assert procedure_query('  /procedure\tcreate  operations user  ') == 'create  operations user'
     assert procedure_query('what is the procedure?') is None
+
+
+def test_compilation_failure_is_controlled_and_never_executes(kb):
+    kb.compile.side_effect = ProcedureCompilationError('internal secret')
+    response = request('POST', '/api/chat', json={'message': '/procedure create user'})
+    assert response.status_code == 200
+    assert 'cannot currently be executed safely' in response.json()['response']
+    assert 'internal secret' not in response.text
+    assert kb.call_tool.await_count == 2
+    kb.direct.assert_not_awaited()
+
+
+def test_non_executable_article_never_compiles(kb):
+    kb.article['description'] = '# Overview'
+    request('POST', '/api/chat', json={'message': '/procedure create user'})
+    kb.compile.assert_not_awaited()
+
+
+def test_retrieved_markdown_runs_real_compiler_without_operational_tools(kb, monkeypatch):
+    from agents import OpenAIChatCompletionsModel
+    from app.procedure_compiler import compile_procedure
+    from test_agent import answer
+
+    # Use real extraction validation with a fake structured model response.
+    kb.article['description'] = MARKDOWN.replace(
+        'If the user already exists, stop the procedure and inform the user.', ''
+    ).replace('Run this step only if the previous step confirms that the user does not exist.', '')
+    definition = ProcedureDefinition.model_validate(extraction())
+    model = AsyncMock(return_value=answer(json.dumps(semantic_payload(definition))))
+    monkeypatch.setattr(OpenAIChatCompletionsModel, 'get_response', model)
+    monkeypatch.setattr(procedures, 'compile_procedure', compile_procedure)
+    response = request('POST', '/api/chat', json={'message': '/procedure create operations user'})
+    assert response.status_code == 200
+    assert 'compiled, validated, and bound successfully' in response.json()['response']
+    assert 'full_name' in response.json()['response']
+    assert kb.call_tool.await_count == 2
+    assert model.await_args.kwargs['tools'] == []
+    kb.direct.assert_not_awaited()
+
+
+def test_real_compilation_diagnostics_stay_server_side(kb, monkeypatch, caplog):
+    import json
+    import logging
+    from agents import OpenAIChatCompletionsModel
+    from app.procedure_compiler import compile_procedure
+    from test_agent import answer
+
+    caplog.set_level(logging.INFO)
+    kb.article['description'] = MARKDOWN
+    data = extraction()
+    data['steps'][2].pop('action')
+    monkeypatch.setattr(OpenAIChatCompletionsModel, 'get_response', AsyncMock(return_value=answer(json.dumps(semantic_payload(data)))))
+    monkeypatch.setattr(procedures, 'compile_procedure', compile_procedure)
+    response = request('POST', '/api/chat', json={'message': '/procedure create user'})
+    assert response.status_code == 200
+    assert response.json()['response'] == (
+        'A procedure knowledge article was found but cannot currently be executed safely: '
+        'compilation or validation failed. No steps have been executed.'
+    )
+    assert 'KB retrieved' in caplog.text and 'Procedure marker found' in caplog.text
+    assert 'stage=pydantic' in caplog.text
+    assert 'steps.2.action' in caplog.text and 'Field required' in caplog.text
+    assert 'steps.2.action' not in response.text
+    assert kb.call_tool.await_count == 2
+    kb.direct.assert_not_awaited()
+
+
+def test_binding_failure_is_generic_and_does_not_execute(kb, config):
+    kb.bind.side_effect = ProcedureBindingError('specific internal binding failure')
+    response = request('POST', '/api/chat', json={'message': '/procedure create user'})
+    assert response.status_code == 200
+    assert 'cannot be mapped safely' in response.json()['response']
+    assert 'specific internal' not in response.text
+    assert 'No steps have been executed' in response.json()['response']
+    kb.direct.assert_not_awaited()
+    assert kb.call_tool.await_count == 2
+    assert kb.bind.await_args.args[0] == kb.compile.return_value
+
+
+def test_real_binding_discovery_reuses_itsm_and_executes_only_kb_calls(kb, monkeypatch):
+    connect = MCPServerStreamableHttp.connect
+    operational_sessions = []
+
+    async def connected(server):
+        await connect(server)
+        if server.name == 'aap':
+            operational_sessions.append(server.session)
+            server.session.list_tools.return_value = ListToolsResult(tools=[
+                Tool(name=name, description=description, inputSchema={
+                    'type': 'object', 'properties': {arg: {'type': 'string'} for arg in args},
+                    'required': args, 'additionalProperties': False,
+                }) for name, description, args in [
+                    ('users_get', 'Get a user', ['username']),
+                    ('users_create', 'Create a user', ['username', 'full_name', 'email']),
+                    ('users_update', 'Update the user team', ['username', 'team']),
+                ]
+            ])
+            server.session.call_tool = AsyncMock(side_effect=AssertionError('No operational tool may execute'))
+
+    monkeypatch.setattr(MCPServerStreamableHttp, 'connect', connected)
+    monkeypatch.setattr(procedures, 'bind_current_tools', real_binding_discovery)
+    from agents import OpenAIChatCompletionsModel
+    model = AsyncMock(side_effect=AssertionError('Clear candidates need no model selection'))
+    monkeypatch.setattr(OpenAIChatCompletionsModel, 'get_response', model)
+    before = kb.compile.return_value.model_dump_json()
+    kb.article['description'] = MARKDOWN
+    response = request('POST', '/api/chat', json={'message': '/procedure create user', 'debug_mode': True})
+    assert response.status_code == 200
+    assert 'compiled, validated, and bound successfully' in response.json()['response']
+    assert 'mcp_aap__users_create' in response.json()['response']
+    assert 'mcp_aap__users_update' in response.json()['response']
+    assert 'namespace' not in response.json()['response']
+    assert kb.compile.return_value.model_dump_json() == before
+    assert kb.article['description'] == MARKDOWN
+    assert [server.name for server in kb.servers] == ['itsm', 'aap']
+    assert len(operational_sessions) == 1
+    operational_sessions[0].list_tools.assert_awaited_once()
+    operational_sessions[0].call_tool.assert_not_awaited()
+    assert kb.call_tool.await_count == 2
+    model.assert_not_awaited()
+    kb.direct.assert_not_awaited()
+
+
+def test_real_binding_no_catalog_match_returns_safe_failure(kb, monkeypatch, caplog):
+    monkeypatch.setattr(procedures, 'bind_current_tools', real_binding_discovery)
+    response = request('POST', '/api/chat', json={'message': '/procedure create user'})
+    assert response.status_code == 200
+    assert 'cannot be mapped safely' in response.json()['response']
+    assert 'step=check_whether_the_user_already_exists' in caplog.text
+    assert 'No compatible tools' in caplog.text
+    assert 'No compatible tools' not in response.text
+    assert kb.call_tool.await_count == 2
+    kb.direct.assert_not_awaited()
+
+
+def test_compilation_failure_never_attempts_binding(kb):
+    kb.compile.side_effect = ProcedureCompilationError('invalid semantic source')
+    request('POST', '/api/chat', json={'message': '/procedure create user'})
+    kb.bind.assert_not_awaited()
+    assert [server.name for server in kb.servers] == ['itsm']

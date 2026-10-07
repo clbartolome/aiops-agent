@@ -100,7 +100,9 @@ def test_rejected_answer_does_not_leak_into_history(model):
             result = await client.post(path + '/messages', json={'message': 'Count pods in production'})
             assert result.json()['response'] == NO_LIVE_DATA
             history = await client.get(path)
-            assert '999' not in history.text and 'secret-namespace' not in history.text
+            # UUIDs/timestamps can contain 999; check stored messages for leaked content.
+            messages = str(history.json()['messages'])
+            assert '999' not in messages and 'secret-namespace' not in messages
             assert history.json()['messages'][-1]['content'] == NO_LIVE_DATA
     asyncio.run(scenario())
 

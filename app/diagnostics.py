@@ -37,7 +37,7 @@ def configure_logging() -> None:
     logging.getLogger("app").setLevel(logging.INFO)
 
 
-def log_failure(logger: logging.Logger, phase: str, error: Exception, secrets=()) -> None:
+def log_failure(logger: logging.Logger, phase: str, error: Exception, secrets=(), *, level=logging.ERROR, context="") -> None:
     # API errors may embed the entire response body; retain only its error message.
     body = getattr(error, "body", None)
     if isinstance(body, dict):
@@ -45,6 +45,7 @@ def log_failure(logger: logging.Logger, phase: str, error: Exception, secrets=()
         message = str(detail.get("message", type(error).__name__)) if isinstance(detail, dict) else str(detail)
     else:
         message = str(error)
+    message = context + message
     values = [*secrets, *(value for key, value in os.environ.items()
                          if any(word in key.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD")))]
     for value in sorted((value for value in values if value), key=len, reverse=True):
@@ -55,4 +56,4 @@ def log_failure(logger: logging.Logger, phase: str, error: Exception, secrets=()
         "[redacted credential]", message,
     )
     message = re.sub(r"(?i)\bBearer\s+\S+", "[redacted credential]", message)
-    logger.error("%s: %s: %s", phase, type(error).__name__, message.replace("\n", " ").replace("\r", " "))
+    logger.log(level, "%s: %s: %s", phase, type(error).__name__, message.replace("\n", " ").replace("\r", " "))

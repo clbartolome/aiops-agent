@@ -4,10 +4,13 @@ import logging
 import re
 
 from agents import Session
+from agents.mcp import MCPServerManager
 
 from app.config import Config
 from app.diagnostics import log_failure
-from app.mcp import create_mcp_servers
+from app.mcp import create_mcp_servers, discover_available_tools, discover_function_tools
+from app.procedure_compiler import ProcedureCompilationError, compile_procedure
+from app.procedure_binding import ProcedureBindingError, bind_procedure, binding_summary
 
 logger = logging.getLogger(__name__)
 EMPTY_PROCEDURE = "Provide a procedure request after /procedure."
@@ -15,6 +18,7 @@ EMPTY_PROCEDURE = "Provide a procedure request after /procedure."
 
 class ProcedureRetrievalError(RuntimeError):
     """A credential-free KB retrieval failure."""
+    category = 'RETRIEVAL_ERROR'
 
 
 def procedure_query(message: str) -> str | None:
@@ -62,7 +66,46 @@ def kb_payload(result) -> dict:
     return payload
 
 
-async def run_procedure(query: str, config: Config, session: Session | None = None) -> str:
+async def bind_current_tools(procedure, config: Config, itsm_server, *, on_bound=None):
+    """Reuse the retrieval connection and discover only additional target systems."""
+    secrets = (config.model_api_key, *(item.token for item in config.mcp_servers))
+    configured = {item.name for item in config.mcp_servers}
+    for step in procedure.steps:
+        if step.system is None or step.system not in configured:
+            reason = "Target system is unknown." if step.system is None else "No matching MCP server."
+            log_failure(logger, "Procedure binding failed", RuntimeError(
+                f"procedure={procedure.id} step={step.id} error={reason}"), secrets)
+            raise ProcedureBindingError(reason)
+    target_systems = {step.system for step in procedure.steps} - {itsm_server.name}
+    try:
+        servers = create_mcp_servers(tuple(item for item in config.mcp_servers if item.name in target_systems))
+        async with MCPServerManager(servers) as manager:
+            if manager.errors:
+                for server, error in manager.errors.items():
+                    log_failure(logger, "Procedure binding MCP discovery failed", error, secrets,
+                                context=f"procedure={procedure.id} step={next(step.id for step in procedure.steps if step.system == server.name)} server={server.name} error=")
+                raise ProcedureBindingError("Required MCP server could not be discovered.")
+            active = [itsm_server, *manager.active_servers]
+            if on_bound is None:
+                tools = await discover_available_tools(active)
+            else:
+                functions = await discover_function_tools(active)
+                tools = await discover_available_tools(active, function_tools=functions)
+            bound = await bind_procedure(procedure, tools, config)
+            if on_bound is not None:
+                bound = await on_bound(bound, functions, active)
+        if manager.errors:
+            raise ProcedureBindingError("MCP discovery cleanup failed.")
+        return bound
+    except ProcedureBindingError:
+        raise
+    except Exception as error:
+        log_failure(logger, "Procedure binding MCP discovery failed", error, secrets,
+                    context=f"procedure={procedure.id} error=")
+        raise ProcedureBindingError("MCP tool discovery failed.") from None
+
+
+async def run_procedure(query: str, config: Config, session: Session | None = None, *, on_bound=None, on_failure=None, debug=False) -> str:
     query = query.strip()
     if not query:
         raise ValueError(EMPTY_PROCEDURE)
@@ -70,6 +113,13 @@ async def run_procedure(query: str, config: Config, session: Session | None = No
     if not itsm:
         raise ProcedureRetrievalError("The ITSM knowledge-base MCP server is not configured.")
     server = create_mcp_servers(itsm)[0]
+    source = None
+    ready = None
+
+    async def capture(bound, functions, servers):
+        nonlocal ready
+        ready = (bound, functions, servers)
+        return bound
     try:
         async with server:
             tools = {tool.name for tool in await server.list_tools()}
@@ -91,18 +141,44 @@ async def run_procedure(query: str, config: Config, session: Session | None = No
                 markdown, title = article["description"], article["title"]
                 if not isinstance(markdown, str) or not isinstance(title, str):
                     raise ProcedureRetrievalError("The ITSM knowledge-base article was invalid.")
+                logger.info("KB retrieved stage=kb_retrieved article=%s", article_id)
                 if has_procedure_section(markdown):
-                    status = "Procedure candidate found. No steps have been executed."
+                    logger.info("Procedure marker found stage=procedure_marker article=%s", article_id)
+                    source = markdown if re.search(r"^# ", markdown, re.M) else f"# {title}\n\n{markdown}"
+                    status = "Procedure candidate found."
                 else:
                     status = ("A relevant knowledge article was found, but it is not an executable "
                               "procedure (missing `## Procedure`).")
                 response = f"{status}\n\n# {title}\n\n{markdown}"
+            if source is not None:
+                try:
+                    definition = await compile_procedure(source, config)
+                except ProcedureCompilationError as error:
+                    if on_failure is not None:
+                        on_failure(error.category)
+                    response = ("A procedure knowledge article was found but cannot currently be executed safely: "
+                                "compilation or validation failed. No steps have been executed.")
+                else:
+                    try:
+                        result = (await bind_current_tools(definition, config, server) if on_bound is None else
+                                  await bind_current_tools(definition, config, server, on_bound=capture))
+                        response = binding_summary(result, debug=debug) if not isinstance(result, str) else result
+                    except ProcedureBindingError:
+                        ready = None
+                        if on_failure is not None:
+                            on_failure('BINDING_ERROR')
+                        response = ("The procedure was found and compiled, but one or more steps cannot be mapped "
+                                    "safely to the available system tools. No steps have been executed.")
     except Exception as error:
-        log_failure(logger, "Procedure KB retrieval failed", error,
+        log_failure(logger, "Procedure KB retrieval failed category=RETRIEVAL_ERROR", error,
                     (config.model_api_key, *(server.token for server in config.mcp_servers)))
         raise ProcedureRetrievalError(
             "Procedure knowledge-base retrieval failed. Check ITSM MCP connectivity and KB tools."
         ) from None
+    if ready is not None:
+        # All retrieval/binding lifecycle checks, including cleanup, have passed.
+        # The runtime reuses these SDK servers/handles; it creates no new clients.
+        response = await on_bound(*ready)
     if session is not None:
         await session.add_items([
             {"role": "user", "content": f"/procedure {query}"},

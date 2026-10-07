@@ -19,6 +19,7 @@ class Conversation:
     updated_at: str = field(default_factory=timestamp)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session: SQLiteSession = field(init=False)
+    active_procedure_run_id: str | None = None
 
     def __post_init__(self):
         self.session = SQLiteSession(self.session_id)
