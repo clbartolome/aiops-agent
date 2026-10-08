@@ -5,13 +5,15 @@ iterations). The parsed-procedure types are small Pydantic models, kept
 intentionally free of any MCP-specific concepts (no tool/server/system
 names) so the KB stays independent from concrete MCP implementations.
 
-No parameter extraction, missing-input prompting, or step execution is
-implemented yet.
+Step execution is not implemented yet.
 """
 from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel
+
+# The only primitive types a declared input/value may hold.
+PrimitiveValue = str | int | float | bool
 
 
 @dataclass(frozen=True)
@@ -36,17 +38,29 @@ class ProcedureStatus:
     """A single, UI-facing snapshot of `/procedure` processing.
 
     `state` is a small machine-readable tag (for example "kb_found",
-    "parsed", "parse_error", "no_result", "not_executable", "empty_query",
-    "mcp_error"). `message` is the human-readable text the chat UI renders
-    as a normal chat message once procedure processing finishes; it is
-    always the *last* entry of `messages` when more than one is produced
-    (for example "KB found: ..." followed by the parsed summary).
+    "collecting_inputs", "ready", "cancelled", "parse_error", "no_result",
+    "not_executable", "empty_query", "mcp_error"). `message` is the
+    human-readable text the chat UI renders as a normal chat message once
+    procedure processing finishes; it is always the *last* entry of
+    `messages` when more than one is produced (for example "KB found: ..."
+    then the parsed summary, then the collected-inputs/ready outcome).
+
+    `progress_stages`, when present, has exactly `len(messages) - 1`
+    entries: the transient progress-bubble label to show right before
+    revealing `messages[i]` for `i > 0`.
+
+    `context` carries the active `ProcedureContext` to persist on the chat
+    session for the next turn (or `None` once there is no procedure left
+    waiting on this session, e.g. after a terminal error or cancellation).
+    It is never serialized to the client.
     """
 
     state: str
     message: str
     title: str | None = None
     messages: tuple[str, ...] | None = None
+    progress_stages: tuple[str, ...] | None = None
+    context: "ProcedureContext | None" = None
 
 
 class ProcedureInput(BaseModel):
@@ -89,13 +103,18 @@ class ProcedureDefinition(BaseModel):
 
 
 class ProcedureContext(BaseModel):
-    """Everything retained in memory for one `/procedure` invocation so far.
+    """The active `/procedure` run retained on a chat session between turns.
 
-    No execution state yet — this is only carried through the current
-    request for this iteration.
+    `inputs` holds the input values collected so far (defaults applied,
+    plus anything deterministically validated from extraction). `status`
+    tracks progress through input collection only; no step-execution state
+    is added yet.
     """
 
+    run_id: str
     original_request: str
     kb_title: str
     kb_content: str
     procedure: ProcedureDefinition
+    inputs: dict[str, PrimitiveValue] = {}
+    status: Literal["COLLECTING_INPUTS", "READY", "CANCELLED"] = "COLLECTING_INPUTS"

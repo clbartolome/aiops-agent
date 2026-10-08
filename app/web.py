@@ -12,7 +12,9 @@ from app.agent import run_agent
 from app.config import load_config
 from app.diagnostics import configure_logging, log_failure
 from app.mcp import MCPConnectionError
-from app.procedure import handle_procedure, is_procedure_command
+from app.procedure import (
+    handle_cancel, handle_procedure, handle_procedure_input_reply, is_cancel_command, is_procedure_command,
+)
 from app.procedure.models import ProcedureStatus
 from app.sessions import Conversation, timestamp, visible_messages
 
@@ -50,26 +52,52 @@ async def chat(request: ChatRequest) -> dict:
 def procedure_payload(status: ProcedureStatus) -> dict:
     # The minimal contract: the final text is always a normal chat message;
     # "state" is kept only in case a later stage needs to branch on it.
-    # "messages" is only present when more than one normal chat message is
-    # produced for a single /procedure request (e.g. "KB found: ..." then
-    # the parsed summary); single-message states omit it.
+    # "messages"/"progress_stages" are only present when a single request
+    # produces more than one sequential chat message (e.g. "KB found: ..."
+    # then the parsed summary, then the collected-inputs/ready outcome).
+    # `status.context` is never serialized: it is server-side-only session
+    # state (it may carry the full KB Markdown and collected input values).
     payload = {"type": "procedure_status", "state": status.state, "message": status.message}
     if status.messages:
         payload["messages"] = list(status.messages)
+    if status.progress_stages:
+        payload["progress_stages"] = list(status.progress_stages)
     return payload
 
 
-async def send_message(request: ChatRequest, session=None) -> dict:
+async def send_message(request: ChatRequest, conversation: Conversation | None = None) -> dict:
     try:
         config = load_config()
     except ValueError:
         raise HTTPException(503, "Check the server's environment configuration.") from None
 
-    # Deterministic, LLM-free routing: only an explicit /procedure prefix
-    # leaves the existing chat/session path. Everything else is unchanged.
-    if is_procedure_command(request.message):
-        return procedure_payload(await handle_procedure(request.message, config))
+    # Deterministic, LLM-free routing priority (a chat session has at most
+    # one active procedure):
+    #   1. /cancel while a procedure is active (collecting inputs or ready)
+    #   2. any reply while a procedure is waiting on input
+    #   3. an explicit /procedure prefix starts a new procedure
+    #   4. everything else is the existing, unchanged normal chat path
+    active = conversation.active_procedure if conversation is not None else None
 
+    if active is not None and is_cancel_command(request.message):
+        status = handle_cancel(active)
+        if conversation is not None:
+            conversation.active_procedure = status.context
+        return procedure_payload(status)
+
+    if active is not None and active.status == "COLLECTING_INPUTS":
+        status = await handle_procedure_input_reply(request.message, active, config)
+        if conversation is not None:
+            conversation.active_procedure = status.context
+        return procedure_payload(status)
+
+    if is_procedure_command(request.message):
+        status = await handle_procedure(request.message, config)
+        if conversation is not None:
+            conversation.active_procedure = status.context
+        return procedure_payload(status)
+
+    session = conversation.session if conversation is not None else None
     try:
         response = (await run_agent(request.message, config) if session is None
                     else await run_agent(request.message, config, session=session))
@@ -116,7 +144,7 @@ async def get_session(session_id: str):
 async def session_message(session_id: str, request: ChatRequest):
     conversation = get_conversation(session_id)
     async with conversation.lock:
-        result = await send_message(request, conversation.session)
+        result = await send_message(request, conversation)
         if conversation.title == "New conversation":
             conversation.title = " ".join(request.message.split())[:60]
         conversation.updated_at = timestamp()

@@ -163,9 +163,21 @@ def test_search_query_extracted_from_command(config, itsm_mcp):
 
 # --- Successful KB retrieval + deterministic parsing --------------------------
 
-def test_successful_kb_retrieval_and_parse(config, itsm_mcp):
+@pytest.fixture
+def no_extraction(monkeypatch):
+    """Deterministic default for tests that don't care about input extraction:
+    the structured extractor finds nothing (never calls a real model/LLM).
+    """
+    import app.procedure as procedure_module
+    mock = AsyncMock(return_value={})
+    monkeypatch.setattr(procedure_module, "extract_procedure_inputs", mock)
+    return mock
+
+
+def test_successful_kb_retrieval_and_parse(config, itsm_mcp, no_extraction):
     """End-to-end: /procedure request -> rag_search_kb (once) -> KB found ->
-    parse that exact KB -> ProcedureDefinition -> two sequential chat messages.
+    parse that exact KB -> ProcedureDefinition -> three sequential chat
+    messages, ending by asking for the one input nothing could fill in.
     """
     itsm_mcp.call_tool.return_value = kb_result(
         {"id": 1, "title": "Inspect namespace health", "description": VALID_PROCEDURE_KB, "score": 0.9},
@@ -176,13 +188,10 @@ def test_successful_kb_retrieval_and_parse(config, itsm_mcp):
     # rag_search_kb was called exactly once; parsing never re-queries the KB.
     assert len(itsm_mcp.calls) == 1
 
-    assert status.state == "parsed"
+    assert status.state == "collecting_inputs"
     assert status.title == "Inspect namespace health"
     assert status.messages == (
         "KB found: Inspect namespace health",
-        status.message,
-    )
-    assert status.message == (
         "Procedure parsed successfully.\n"
         "\n"
         "Required inputs:\n"
@@ -192,8 +201,14 @@ def test_successful_kb_retrieval_and_parse(config, itsm_mcp):
         "1. Verify that the namespace exists\n"
         "2. List pods in the namespace\n"
         "3. Review recent events\n"
-        "4. Inspect deployments"
+        "4. Inspect deployments",
+        "What namespace should I use?",
     )
+    assert status.message == "What namespace should I use?"
+    assert status.progress_stages == ("Parsing procedure", "Extracting inputs")
+    assert status.context is not None
+    assert status.context.status == "COLLECTING_INPUTS"
+    assert status.context.inputs == {}
 
 
 def test_parse_error_kb_stops_without_falling_back_to_agent(config, itsm_mcp):

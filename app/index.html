@@ -108,6 +108,12 @@
     // -> parsing) revealed from a single response; no second request is made.
     const PROCEDURE_STAGE_DELAY_MS = 500;
     let procedureMode = false;
+    // True right after a response asks for more procedure input (state
+    // "collecting_inputs"). The *next* plain message belongs to that
+    // procedure server-side regardless of this flag (routing is decided by
+    // the backend's active-procedure session state) — this is only a UI
+    // hint for which transient label/status text to show while waiting.
+    let procedureAwaitingInput = false;
 
     function enterProcedureMode(remainder) {
       procedureMode = true;
@@ -170,6 +176,7 @@
       try {
         const session = await api(`/api/sessions/${id}`);
         selectedSession = id;
+        procedureAwaitingInput = false;
         history.replaceChildren();
         input.value = '';
         for (const message of session.messages) appendMessage(message.content, message.role);
@@ -189,6 +196,7 @@
       try {
         const session = await api('/api/sessions', { method: 'POST' });
         selectedSession = session.session_id;
+        procedureAwaitingInput = false;
         history.replaceChildren();
         input.value = '';
         await refreshSessions();
@@ -311,16 +319,21 @@
       const sessionId = selectedSession;
       const isProcedure = PROCEDURE_PATTERN.test(message);
       const procedureQuery = isProcedure ? (message.match(PROCEDURE_PATTERN)[2] || '').trim() : '';
+      // A plain reply while a procedure is waiting on input is still a
+      // normal-looking chat message; the backend's active-procedure session
+      // state (not this flag) is what actually routes it to the procedure.
+      const isProcedureReply = !isProcedure && procedureAwaitingInput;
 
       if (isProcedure) appendProcedureMessage(procedureQuery);
       else appendMessage(message, 'user');
       input.value = '';
       exitProcedureMode();
       setBusy(true);
-      status.textContent = isProcedure ? '' : 'Working…';
+      status.textContent = (isProcedure || isProcedureReply) ? '' : 'Working…';
 
       // An empty "/procedure" needs no MCP call, so no loading state is shown.
       if (isProcedure && procedureQuery) procedureProgress.show('Searching KB');
+      else if (isProcedureReply) procedureProgress.show('Extracting inputs');
 
       try {
         const response = await fetch(`/api/sessions/${sessionId}/messages`, {
@@ -333,22 +346,26 @@
           throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
         }
         procedureProgress.hide();
-        if (isProcedure && data.type === 'procedure_status') {
-          // A single /procedure request can produce more than one normal
-          // chat message in sequence (e.g. "KB found: ..." then the parsed
-          // summary). Reveal them one at a time, showing the reusable
-          // transient progress bubble for the next stage in between.
+        if (data.type === 'procedure_status') {
+          // A single /procedure request/reply can produce more than one
+          // normal chat message in sequence (e.g. "KB found: ..." then the
+          // parsed summary, then the collected-inputs/ready outcome).
+          // Reveal them one at a time, showing the reusable transient
+          // progress bubble (with its own label per stage) in between.
           const messages = data.messages && data.messages.length ? data.messages : [data.message];
+          const stages = data.progress_stages || [];
           for (let index = 0; index < messages.length; index++) {
             if (index > 0) {
-              procedureProgress.show('Parsing procedure');
+              procedureProgress.show(stages[index - 1] || 'Parsing procedure');
               await new Promise((resolve) => setTimeout(resolve, PROCEDURE_STAGE_DELAY_MS));
               procedureProgress.hide();
             }
             appendMessage(messages[index], 'assistant');
           }
+          procedureAwaitingInput = data.state === 'collecting_inputs';
         } else {
           appendMessage(data.response, 'assistant');
+          procedureAwaitingInput = false;
         }
         await refreshSessions();
       } catch (error) {

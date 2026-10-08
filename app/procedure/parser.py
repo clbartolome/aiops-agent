@@ -97,8 +97,14 @@ def _parse_bool(value: str, field_label: str) -> bool:
     raise ProcedureParseError(f"Invalid {field_label}: {value!r}. Expected yes/no or true/false.")
 
 
-def _parse_default(raw: str) -> str | int | float | bool:
-    """Parse an explicitly declared default into one of the supported primitives."""
+def coerce_primitive(raw: str) -> str | int | float | bool:
+    """Deterministically coerce raw text into one of the supported primitives.
+
+    Tries boolean words, then integer, then float, falling back to the
+    trimmed original string. Used both for declared KB defaults and for the
+    single-missing-input reply shortcut (see `app.procedure`); no LLM is
+    involved.
+    """
     stripped = raw.strip()
     lowered = stripped.lower()
     if lowered in _TRUE_WORDS:
@@ -178,7 +184,7 @@ def _parse_inputs(body: str) -> list[ProcedureInput]:
         default_match = _DEFAULT_RE.search(description)
         if default_match:
             try:
-                default = _parse_default(default_match.group(1))
+                default = coerce_primitive(default_match.group(1))
             except Exception as error:
                 raise ProcedureParseError(
                     f"Unable to parse default for input {label!r}: {default_match.group(1)!r}"

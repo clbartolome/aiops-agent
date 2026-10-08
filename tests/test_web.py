@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -73,7 +74,11 @@ def test_page_hides_progress_before_showing_the_final_message(agent):
     page = request("GET", "/").text
     # Both the success and the error path hide the transient bubble before
     # rendering the outcome(s) as normal chat message(s), never both at once.
-    assert "procedureProgress.hide();\n        if (isProcedure && data.type === 'procedure_status') {" in page
+    # The response is routed by its own "procedure_status" type, not by
+    # whether the outgoing message happened to start with "/procedure" (a
+    # plain reply while a procedure is waiting on input must take this path
+    # too, see test_page_tracks_procedure_awaiting_input_across_replies).
+    assert "procedureProgress.hide();\n        if (data.type === 'procedure_status') {" in page
     assert "procedureProgress.hide();\n        appendMessage(`Error: ${error.message}`, 'error');" in page
 
 
@@ -81,9 +86,22 @@ def test_page_reveals_sequential_procedure_messages_with_progress_between(agent)
     page = request("GET", "/").text
     # A single /procedure response can carry more than one chat message
     # (e.g. "KB found: ..." then the parsed summary); each later one is
-    # revealed after showing the reusable progress bubble again.
+    # revealed after showing the reusable progress bubble again, labeled
+    # per-stage from the server when provided.
     assert "const messages = data.messages && data.messages.length ? data.messages : [data.message];" in page
-    assert "procedureProgress.show('Parsing procedure');" in page
+    assert "const stages = data.progress_stages || [];" in page
+    assert "procedureProgress.show(stages[index - 1] || 'Parsing procedure');" in page
+
+
+def test_page_tracks_procedure_awaiting_input_across_replies(agent):
+    page = request("GET", "/").text
+    # A plain reply while a procedure is waiting on input shows the reusable
+    # progress bubble too, and the flag is recomputed from the response
+    # state (never assumed) after every request.
+    assert "let procedureAwaitingInput = false;" in page
+    assert "const isProcedureReply = !isProcedure && procedureAwaitingInput;" in page
+    assert "else if (isProcedureReply) procedureProgress.show('Extracting inputs');" in page
+    assert "procedureAwaitingInput = data.state === 'collecting_inputs';" in page
 
 
 def test_page_skips_progress_for_empty_procedure_command(agent):
@@ -207,3 +225,138 @@ def test_natural_language_mention_of_procedure_uses_existing_agent_path(agent, p
     assert response.json() == {"response": agent.return_value}
     agent.assert_awaited_once_with(message, config)
     procedure.assert_not_awaited()
+
+
+# --- One active procedure per chat session: routing priority ----------------
+# A chat session (not the stateless /api/chat endpoint) remembers at most one
+# active procedure. These tests drive the real /api/sessions endpoints and
+# mock only app.procedure's entry points, so the routing priority itself
+# (cancel > input reply > new /procedure > normal chat) is exercised for real.
+
+def make_procedure_context(status="COLLECTING_INPUTS", inputs=None):
+    from app.procedure.models import ProcedureContext, ProcedureDefinition
+
+    procedure = ProcedureDefinition(
+        id="inspect-namespace-health", version=1, title="Inspect namespace health",
+        risk="low", confirmation_required=False,
+        inputs=[], steps=[{"id": "step-1", "title": "Step 1", "instruction": "Do it."}],
+    )
+    return ProcedureContext(
+        run_id="run-1", original_request="inspect namespace health", kb_title="Inspect namespace health",
+        kb_content="# Inspect namespace health\n", procedure=procedure, inputs=inputs or {}, status=status,
+    )
+
+
+@pytest.fixture
+def procedure_lifecycle(monkeypatch):
+    """Mock the three app.procedure entry points `web` calls, independent of
+    the `procedure`/`agent` fixtures above.
+    """
+    start = AsyncMock()
+    reply = AsyncMock()
+    cancel = Mock()
+    monkeypatch.setattr(web, "handle_procedure", start)
+    monkeypatch.setattr(web, "handle_procedure_input_reply", reply)
+    monkeypatch.setattr(web, "handle_cancel", cancel)
+    return SimpleNamespace(start=start, reply=reply, cancel=cancel)
+
+
+def create_test_session():
+    return request("POST", "/api/sessions").json()["session_id"]
+
+
+def test_active_procedure_consumes_next_reply_not_the_agent(agent, procedure_lifecycle, config):
+    from app.procedure.models import ProcedureStatus
+
+    session_id = create_test_session()
+    waiting_context = make_procedure_context(status="COLLECTING_INPUTS")
+    procedure_lifecycle.start.return_value = ProcedureStatus(
+        state="collecting_inputs", message="What namespace should I use?", context=waiting_context,
+    )
+
+    response = request("POST", f"/api/sessions/{session_id}/messages",
+                        json={"message": "/procedure inspect namespace health"})
+    assert response.status_code == 200
+    assert response.json()["message"] == "What namespace should I use?"
+    agent.assert_not_awaited()
+
+    ready_context = make_procedure_context(status="READY", inputs={"namespace": "payments"})
+    procedure_lifecycle.reply.return_value = ProcedureStatus(
+        state="ready", message="Procedure is ready to execute.", context=ready_context,
+    )
+
+    response = request("POST", f"/api/sessions/{session_id}/messages", json={"message": "payments"})
+    assert response.status_code == 200
+    assert response.json() == {"type": "procedure_status", "state": "ready",
+                                "message": "Procedure is ready to execute."}
+    procedure_lifecycle.reply.assert_awaited_once_with("payments", waiting_context, config)
+    agent.assert_not_awaited()
+
+
+def test_after_ready_normal_chat_is_not_consumed_by_the_procedure(agent, procedure_lifecycle, config):
+    from app.procedure.models import ProcedureStatus
+
+    session_id = create_test_session()
+    ready_context = make_procedure_context(status="READY", inputs={"namespace": "payments"})
+    procedure_lifecycle.start.return_value = ProcedureStatus(
+        state="ready", message="Procedure is ready to execute.", context=ready_context,
+    )
+    request("POST", f"/api/sessions/{session_id}/messages",
+            json={"message": "/procedure inspect namespace health for namespace payments"})
+
+    response = request("POST", f"/api/sessions/{session_id}/messages", json={"message": "hello"})
+    assert response.status_code == 200
+    assert response.json() == {"response": agent.return_value}
+    assert agent.await_args.args[:2] == ("hello", config)
+    procedure_lifecycle.reply.assert_not_awaited()
+
+
+def test_routing_regression_without_an_active_procedure(agent, procedure_lifecycle, config):
+    session_id = create_test_session()
+    response = request("POST", f"/api/sessions/{session_id}/messages", json={"message": "hello"})
+    assert response.status_code == 200
+    assert response.json() == {"response": agent.return_value}
+    assert agent.await_args.args[:2] == ("hello", config)
+    procedure_lifecycle.start.assert_not_awaited()
+    procedure_lifecycle.reply.assert_not_awaited()
+
+
+def test_cancel_clears_the_active_procedure(agent, procedure_lifecycle, config):
+    from app.procedure.models import ProcedureStatus
+
+    session_id = create_test_session()
+    waiting_context = make_procedure_context(status="COLLECTING_INPUTS")
+    procedure_lifecycle.start.return_value = ProcedureStatus(
+        state="collecting_inputs", message="What namespace should I use?", context=waiting_context,
+    )
+    request("POST", f"/api/sessions/{session_id}/messages",
+            json={"message": "/procedure inspect namespace health"})
+
+    procedure_lifecycle.cancel.return_value = ProcedureStatus(
+        state="cancelled", message="Procedure cancelled.", context=None,
+    )
+    response = request("POST", f"/api/sessions/{session_id}/messages", json={"message": "/cancel"})
+    assert response.status_code == 200
+    assert response.json() == {"type": "procedure_status", "state": "cancelled", "message": "Procedure cancelled."}
+    procedure_lifecycle.cancel.assert_called_once_with(waiting_context)
+
+    # The context is gone: a normal message now reaches the agent, not the
+    # (now inactive) procedure reply handler.
+    response = request("POST", f"/api/sessions/{session_id}/messages", json={"message": "hello"})
+    assert response.status_code == 200
+    assert response.json() == {"response": agent.return_value}
+    procedure_lifecycle.reply.assert_not_awaited()
+
+
+def test_procedure_context_never_appears_in_the_response(agent, procedure_lifecycle, config):
+    from app.procedure.models import ProcedureStatus
+
+    session_id = create_test_session()
+    context = make_procedure_context(status="COLLECTING_INPUTS")
+    procedure_lifecycle.start.return_value = ProcedureStatus(
+        state="collecting_inputs", message="What namespace should I use?", context=context,
+    )
+    response = request("POST", f"/api/sessions/{session_id}/messages",
+                        json={"message": "/procedure inspect namespace health"})
+    assert "context" not in response.json()
+    assert context.kb_content not in response.text
