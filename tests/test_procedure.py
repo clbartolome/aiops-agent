@@ -11,6 +11,7 @@ from app.procedure import (
     EMPTY_QUERY_MESSAGE,
     MCP_FAILURE_MESSAGE,
     NO_RESULT_MESSAGE,
+    NOT_EXECUTABLE_MESSAGE,
     RAG_SEARCH_TOOL,
     extract_procedure_query,
     handle_procedure,
@@ -148,8 +149,7 @@ def test_non_executable_kb_stops_the_procedure_path(config, itsm_mcp):
     )
     status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
     assert status.state == "not_executable"
-    assert "KB found: Inspect namespace health" in status.message
-    assert "This KB is not an executable procedure." in status.message
+    assert status.message == NOT_EXECUTABLE_MESSAGE
 
 
 # --- MCP failure ---------------------------------------------------------------

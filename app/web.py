@@ -48,10 +48,9 @@ async def chat(request: ChatRequest) -> dict[str, str]:
 
 
 def procedure_payload(status: ProcedureStatus) -> dict:
-    payload = {"type": "procedure_status", "state": status.state, "message": status.message}
-    if status.title:
-        payload["title"] = status.title
-    return payload
+    # The minimal contract: the final text is always a normal chat message;
+    # "state" is kept only in case a later stage needs to branch on it.
+    return {"type": "procedure_status", "state": status.state, "message": status.message}
 
 
 async def send_message(request: ChatRequest, session=None) -> dict:

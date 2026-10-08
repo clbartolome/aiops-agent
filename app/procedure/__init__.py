@@ -27,8 +27,9 @@ RAG_SEARCH_TOOL = "rag_search_kb"
 ITSM_SERVER_NAME = "itsm"
 
 EMPTY_QUERY_MESSAGE = "Please provide a procedure request after /procedure."
-NO_RESULT_MESSAGE = "No matching KB procedure found."
-MCP_FAILURE_MESSAGE = "Unable to retrieve the procedure from the knowledge base."
+NO_RESULT_MESSAGE = "No matching procedure was found."
+NOT_EXECUTABLE_MESSAGE = "KB found, but it is not an executable procedure."
+MCP_FAILURE_MESSAGE = "Unable to retrieve a matching procedure from the knowledge base."
 
 # Matches "/procedure" alone, or "/procedure" followed by whitespace and the
 # rest of the request. Anything else (e.g. "/proceduresomething") is rejected.
@@ -119,7 +120,7 @@ async def handle_procedure(message: str, config: Config) -> ProcedureStatus:
     if not is_executable_procedure(request.kb.content):
         return ProcedureStatus(
             state="not_executable",
-            message=f"KB found: {request.kb.title}\n\nThis KB is not an executable procedure.",
+            message=NOT_EXECUTABLE_MESSAGE,
             title=request.kb.title,
         )
 

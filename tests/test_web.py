@@ -53,23 +53,33 @@ def test_page_includes_distinct_procedure_message_styling(agent):
     assert "appendProcedureMessage" in page
 
 
-def test_page_includes_procedure_status_card(agent):
+def test_page_includes_transient_procedure_progress(agent):
     page = request("GET", "/").text
-    assert "procedure-card" in page
-    assert "createProcedureCard" in page
-    assert "Searching knowledge base" in page
+    assert "procedure-progress" in page
+    assert "procedureProgress" in page
+    assert "Searching KB" in page
+    # The permanent card/heading from the previous iteration must be gone.
+    assert "procedure-card" not in page
+    assert "createProcedureCard" not in page
 
 
 def test_page_includes_animated_pending_indicator(agent):
     page = request("GET", "/").text
-    assert "startProcedureEllipsis" in page
+    assert "ELLIPSIS_FRAMES" in page
     assert "'...'" in page
 
 
-def test_page_updates_same_card_on_retrieval(agent):
+def test_page_hides_progress_before_showing_the_final_message(agent):
     page = request("GET", "/").text
-    assert "setProcedureLine(card, data.message)" in page
-    assert "data.state !== 'kb_found'" in page
+    # Both the success and the error path hide the transient bubble before
+    # rendering the outcome as a normal chat message, never both at once.
+    assert "procedureProgress.hide();\n        if (isProcedure && data.type === 'procedure_status') {\n          appendMessage(data.message, 'assistant');" in page
+    assert "procedureProgress.hide();\n        appendMessage(`Error: ${error.message}`, 'error');" in page
+
+
+def test_page_skips_progress_for_empty_procedure_command(agent):
+    page = request("GET", "/").text
+    assert "if (isProcedure && procedureQuery) procedureProgress.show('Searching KB');" in page
 
 
 def test_chat_reuses_agent(agent, config):
@@ -140,7 +150,7 @@ def test_error_logging_omits_response_payload(agent, caplog):
 @pytest.fixture
 def procedure(monkeypatch):
     from app.procedure.models import ProcedureStatus
-    mock = AsyncMock(return_value=ProcedureStatus(state="kb_found", message="KB found: Test", title="Test"))
+    mock = AsyncMock(return_value=ProcedureStatus(state="kb_found", message="KB found: Test"))
     monkeypatch.setattr(web, "handle_procedure", mock)
     return mock
 
@@ -148,8 +158,7 @@ def procedure(monkeypatch):
 def test_procedure_message_uses_procedure_handler(agent, procedure, config):
     response = request("POST", "/api/chat", json={"message": "/procedure inspect namespace health"})
     assert response.status_code == 200
-    assert response.json() == {"type": "procedure_status", "state": "kb_found",
-                                "message": "KB found: Test", "title": "Test"}
+    assert response.json() == {"type": "procedure_status", "state": "kb_found", "message": "KB found: Test"}
     procedure.assert_awaited_once_with("/procedure inspect namespace health", config)
     agent.assert_not_awaited()
 

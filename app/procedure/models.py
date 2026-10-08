@@ -28,10 +28,10 @@ class ProcedureRequest:
 class ProcedureStatus:
     """A single, UI-facing snapshot of `/procedure` processing.
 
-    `state` is a small machine-readable tag (for example "searching_kb",
-    "kb_found", "no_result", "not_executable", "empty_query", "mcp_error").
-    `message` is the human-readable text the chat UI renders in the
-    procedure status block.
+    `state` is a small machine-readable tag (for example "kb_found",
+    "no_result", "not_executable", "empty_query", "mcp_error").
+    `message` is the human-readable text the chat UI renders as a normal
+    chat message once procedure processing finishes.
     """
 
     state: str

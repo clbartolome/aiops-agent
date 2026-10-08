@@ -53,10 +53,14 @@
       letter-spacing: .08em; margin-bottom: 4px; }
     .message.procedure-user { white-space: pre-wrap; border-left: 3px solid #8cd8b1;
       background: rgba(140, 216, 177, .07); border-radius: 0 4px 4px 0; padding: 6px 12px; }
-    .procedure-card { border: 1px solid #353a40; border-left: 3px solid #8cd8b1;
-      border-radius: 0 4px 4px 0; padding: 10px 12px; background: #15181b; }
-    .procedure-card .procedure-line { white-space: pre-wrap; }
-    .procedure-card .procedure-ellipsis { color: #9ba4af; min-height: 1.4em; }
+
+    /* Transient procedure progress: a tiny, iOS-typing-indicator-like bubble.
+       It never joins chat history — it is removed from the DOM once the
+       current operation finishes, success or failure. */
+    .procedure-progress { display: inline-flex; align-items: baseline; gap: 2px;
+      margin: 0 0 24px; padding: 5px 12px; border-radius: 12px; background: #1a1d21;
+      color: #9ba4af; font-size: 14px; }
+    .procedure-progress-ellipsis { display: inline-block; min-width: 1.4em; text-align: left; }
   </style>
 </head>
 <body>
@@ -244,47 +248,57 @@
       form.scrollIntoView({ block: 'end' });
     }
 
-    // Procedure execution status lives in its own small card, updated in
-    // place (never a new assistant message) as retrieval progresses.
+    // Reusable transient progress indicator. Procedure stages call show()/
+    // update()/hide() with a short label (e.g. "Searching KB", later
+    // "Parsing procedure", "Running step 1", ...). Only one instance is ever
+    // visible; it never becomes part of chat history and disappears
+    // completely — success or failure — once the current operation ends.
     const ELLIPSIS_FRAMES = ['.', '..', '...'];
 
-    function createProcedureCard() {
-      const card = document.createElement('div');
-      card.className = 'message procedure-card';
-      const label = document.createElement('div');
-      label.className = 'procedure-label';
-      label.textContent = 'PROCEDURE';
-      const line = document.createElement('div');
-      line.className = 'procedure-line';
-      const ellipsis = document.createElement('div');
-      ellipsis.className = 'procedure-ellipsis';
-      ellipsis.setAttribute('aria-hidden', 'true');
-      card.append(label, line, ellipsis);
-      history.append(card);
-      form.scrollIntoView({ block: 'end' });
-      return { line, ellipsis, timer: null };
-    }
+    const procedureProgress = (() => {
+      let element = null;
+      let label = null;
+      let timer = null;
 
-    function setProcedureLine(card, text) {
-      card.line.textContent = text;
-    }
-
-    function startProcedureEllipsis(card) {
-      let index = 0;
-      card.ellipsis.textContent = ELLIPSIS_FRAMES[0];
-      card.timer = setInterval(() => {
-        index = (index + 1) % ELLIPSIS_FRAMES.length;
-        card.ellipsis.textContent = ELLIPSIS_FRAMES[index];
-      }, 400);
-    }
-
-    function stopProcedureEllipsis(card) {
-      if (card.timer) {
-        clearInterval(card.timer);
-        card.timer = null;
+      function show(text) {
+        hide();
+        element = document.createElement('div');
+        element.className = 'procedure-progress';
+        label = document.createElement('span');
+        label.textContent = text;
+        const ellipsis = document.createElement('span');
+        ellipsis.className = 'procedure-progress-ellipsis';
+        ellipsis.setAttribute('aria-hidden', 'true');
+        element.append(label, ellipsis);
+        history.append(element);
+        form.scrollIntoView({ block: 'end' });
+        let index = 0;
+        ellipsis.textContent = ELLIPSIS_FRAMES[0];
+        timer = setInterval(() => {
+          index = (index + 1) % ELLIPSIS_FRAMES.length;
+          ellipsis.textContent = ELLIPSIS_FRAMES[index];
+        }, 400);
       }
-      card.ellipsis.textContent = '';
-    }
+
+      function update(text) {
+        if (label) label.textContent = text;
+        else show(text);
+      }
+
+      function hide() {
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+        if (element) {
+          element.remove();
+          element = null;
+          label = null;
+        }
+      }
+
+      return { show, update, hide };
+    })();
 
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -302,12 +316,8 @@
       setBusy(true);
       status.textContent = isProcedure ? '' : 'Working…';
 
-      let card = null;
-      if (isProcedure) {
-        card = createProcedureCard();
-        setProcedureLine(card, 'Searching knowledge base');
-        startProcedureEllipsis(card);
-      }
+      // An empty "/procedure" needs no MCP call, so no loading state is shown.
+      if (isProcedure && procedureQuery) procedureProgress.show('Searching KB');
 
       try {
         const response = await fetch(`/api/sessions/${sessionId}/messages`, {
@@ -319,20 +329,16 @@
         if (!response.ok) {
           throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
         }
-        if (card && data.type === 'procedure_status') {
-          setProcedureLine(card, data.message);
-          if (data.state !== 'kb_found') stopProcedureEllipsis(card);
+        procedureProgress.hide();
+        if (isProcedure && data.type === 'procedure_status') {
+          appendMessage(data.message, 'assistant');
         } else {
           appendMessage(data.response, 'assistant');
         }
         await refreshSessions();
       } catch (error) {
-        if (card) {
-          stopProcedureEllipsis(card);
-          setProcedureLine(card, `Error: ${error.message}`);
-        } else {
-          appendMessage(`Error: ${error.message}`, 'error');
-        }
+        procedureProgress.hide();
+        appendMessage(`Error: ${error.message}`, 'error');
       } finally {
         setBusy(false);
         status.textContent = '';
