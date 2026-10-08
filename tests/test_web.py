@@ -35,6 +35,43 @@ def test_page_does_not_call_agent(agent):
     agent.assert_not_awaited()
 
 
+# --- Procedure UI markers ----------------------------------------------------
+# This project has no JS test runner, so (as with the assertions above) these
+# check the rendered page for the required procedure-mode building blocks.
+
+def test_page_includes_procedure_input_mode(agent):
+    page = request("GET", "/").text
+    assert 'id="procedure-chip"' in page
+    assert "PROCEDURE_PATTERN" in page
+    assert "enterProcedureMode" in page
+    assert "procedure-input" in page
+
+
+def test_page_includes_distinct_procedure_message_styling(agent):
+    page = request("GET", "/").text
+    assert "procedure-user" in page
+    assert "appendProcedureMessage" in page
+
+
+def test_page_includes_procedure_status_card(agent):
+    page = request("GET", "/").text
+    assert "procedure-card" in page
+    assert "createProcedureCard" in page
+    assert "Searching knowledge base" in page
+
+
+def test_page_includes_animated_pending_indicator(agent):
+    page = request("GET", "/").text
+    assert "startProcedureEllipsis" in page
+    assert "'...'" in page
+
+
+def test_page_updates_same_card_on_retrieval(agent):
+    page = request("GET", "/").text
+    assert "setProcedureLine(card, data.message)" in page
+    assert "data.state !== 'kb_found'" in page
+
+
 def test_chat_reuses_agent(agent, config):
     response = request("POST", "/api/chat", json={"message": "  Check pods  "})
     assert response.status_code == 200
@@ -94,3 +131,41 @@ def test_error_logging_omits_response_payload(agent, caplog):
     assert response.status_code == 502
     assert "Unsupported tool choice" in caplog.text
     assert "sensitive-payload" not in caplog.text + response.text
+
+
+# --- Deterministic /procedure routing ---------------------------------------
+# No LLM classifies these messages: only the literal "/procedure" prefix
+# diverts from the existing OperationsAgent chat path.
+
+@pytest.fixture
+def procedure(monkeypatch):
+    from app.procedure.models import ProcedureStatus
+    mock = AsyncMock(return_value=ProcedureStatus(state="kb_found", message="KB found: Test", title="Test"))
+    monkeypatch.setattr(web, "handle_procedure", mock)
+    return mock
+
+
+def test_procedure_message_uses_procedure_handler(agent, procedure, config):
+    response = request("POST", "/api/chat", json={"message": "/procedure inspect namespace health"})
+    assert response.status_code == 200
+    assert response.json() == {"type": "procedure_status", "state": "kb_found",
+                                "message": "KB found: Test", "title": "Test"}
+    procedure.assert_awaited_once_with("/procedure inspect namespace health", config)
+    agent.assert_not_awaited()
+
+
+def test_normal_message_uses_existing_agent_path(agent, procedure, config):
+    response = request("POST", "/api/chat", json={"message": "inspect namespace health"})
+    assert response.status_code == 200
+    assert response.json() == {"response": agent.return_value}
+    agent.assert_awaited_once_with("inspect namespace health", config)
+    procedure.assert_not_awaited()
+
+
+def test_natural_language_mention_of_procedure_uses_existing_agent_path(agent, procedure, config):
+    message = "what is the procedure for inspecting namespace health?"
+    response = request("POST", "/api/chat", json={"message": message})
+    assert response.status_code == 200
+    assert response.json() == {"response": agent.return_value}
+    agent.assert_awaited_once_with(message, config)
+    procedure.assert_not_awaited()

@@ -36,11 +36,27 @@
     input { min-width: 0; flex: 1; font: inherit; color: inherit; background: transparent;
             border: 0; border-bottom: 1px solid #353a40; padding: 8px 0; border-radius: 0; }
     input:focus { outline: none; border-color: #8cd8b1; }
+    input.procedure-input { border-color: #8cd8b1; }
     button { font: inherit; background: transparent; color: #9ba4af; border: 1px solid #353a40;
              border-radius: 4px; padding: 4px 10px; cursor: pointer; }
     button:focus-visible { outline: 2px solid #8cd8b1; }
     button:disabled { cursor: wait; opacity: .5; }
     #status { min-height: 24px; }
+
+    /* /procedure mode: a small, consistent accent — not a redesign of the input. */
+    .procedure-chip { display: inline-flex; align-items: center; flex-shrink: 0;
+      padding: 3px 8px; border-radius: 4px; background: rgba(140, 216, 177, .15);
+      border: 1px solid #8cd8b1; color: #8cd8b1; font-size: 11px; font-weight: bold;
+      letter-spacing: .06em; white-space: nowrap; }
+    .procedure-chip[hidden] { display: none; }
+    .procedure-label { color: #8cd8b1; font-size: 11px; font-weight: bold;
+      letter-spacing: .08em; margin-bottom: 4px; }
+    .message.procedure-user { white-space: pre-wrap; border-left: 3px solid #8cd8b1;
+      background: rgba(140, 216, 177, .07); border-radius: 0 4px 4px 0; padding: 6px 12px; }
+    .procedure-card { border: 1px solid #353a40; border-left: 3px solid #8cd8b1;
+      border-radius: 0 4px 4px 0; padding: 10px 12px; background: #15181b; }
+    .procedure-card .procedure-line { white-space: pre-wrap; }
+    .procedure-card .procedure-ellipsis { color: #9ba4af; min-height: 1.4em; }
   </style>
 </head>
 <body>
@@ -58,7 +74,8 @@
     <section id="history" role="log" aria-label="Conversation" aria-live="polite"></section>
     <form id="chat">
       <label for="message" aria-label="Your message">&gt;</label>
-      <input id="message" name="message" placeholder="Ask about your systems…" autocomplete="off" required autofocus>
+      <span id="procedure-chip" class="procedure-chip" hidden>PROCEDURE</span>
+      <input id="message" name="message" placeholder="Ask about your systems…" autocomplete="off" autofocus>
       <button type="submit">Send</button>
     </form>
     <p id="status" class="hint" role="status"></p>
@@ -72,11 +89,45 @@
     const button = form.querySelector('button');
     const history = document.querySelector('#history');
     const status = document.querySelector('#status');
+    const procedureChip = document.querySelector('#procedure-chip');
 
     const sessionList = document.querySelector('#sessions');
     const newButton = document.querySelector('#new-session');
     let selectedSession = null;
     let busy = false;
+
+    // Deterministic /procedure routing mirrors the backend: only the literal
+    // "/procedure" prefix (followed by whitespace or the end of input) activates
+    // procedure mode. No natural-language inference happens here either.
+    const PROCEDURE_PATTERN = /^\/procedure(\s(.*))?$/s;
+    let procedureMode = false;
+
+    function enterProcedureMode(remainder) {
+      procedureMode = true;
+      procedureChip.hidden = false;
+      input.classList.add('procedure-input');
+      input.value = remainder;
+    }
+
+    function exitProcedureMode(restoreText) {
+      procedureMode = false;
+      procedureChip.hidden = true;
+      input.classList.remove('procedure-input');
+      if (restoreText !== undefined) input.value = restoreText;
+    }
+
+    input.addEventListener('input', () => {
+      if (procedureMode) return;
+      const match = input.value.match(/^\/procedure\s(.*)$/s);
+      if (match) enterProcedureMode(match[1]);
+    });
+
+    input.addEventListener('keydown', (event) => {
+      if (procedureMode && event.key === 'Backspace' && input.value === '') {
+        event.preventDefault();
+        exitProcedureMode('/procedure');
+      }
+    });
 
     async function api(path, options) {
       const response = await fetch(path, options);
@@ -178,15 +229,86 @@
       form.scrollIntoView({ block: 'end' });
     }
 
+    // A /procedure request is visibly distinct from a normal chat message:
+    // a labeled, accent-bordered line instead of the plain "> text" bubble.
+    function appendProcedureMessage(query) {
+      const line = document.createElement('div');
+      line.className = 'message procedure-user';
+      const label = document.createElement('div');
+      label.className = 'procedure-label';
+      label.textContent = 'PROCEDURE';
+      const body = document.createElement('div');
+      body.textContent = query;
+      line.append(label, body);
+      history.append(line);
+      form.scrollIntoView({ block: 'end' });
+    }
+
+    // Procedure execution status lives in its own small card, updated in
+    // place (never a new assistant message) as retrieval progresses.
+    const ELLIPSIS_FRAMES = ['.', '..', '...'];
+
+    function createProcedureCard() {
+      const card = document.createElement('div');
+      card.className = 'message procedure-card';
+      const label = document.createElement('div');
+      label.className = 'procedure-label';
+      label.textContent = 'PROCEDURE';
+      const line = document.createElement('div');
+      line.className = 'procedure-line';
+      const ellipsis = document.createElement('div');
+      ellipsis.className = 'procedure-ellipsis';
+      ellipsis.setAttribute('aria-hidden', 'true');
+      card.append(label, line, ellipsis);
+      history.append(card);
+      form.scrollIntoView({ block: 'end' });
+      return { line, ellipsis, timer: null };
+    }
+
+    function setProcedureLine(card, text) {
+      card.line.textContent = text;
+    }
+
+    function startProcedureEllipsis(card) {
+      let index = 0;
+      card.ellipsis.textContent = ELLIPSIS_FRAMES[0];
+      card.timer = setInterval(() => {
+        index = (index + 1) % ELLIPSIS_FRAMES.length;
+        card.ellipsis.textContent = ELLIPSIS_FRAMES[index];
+      }, 400);
+    }
+
+    function stopProcedureEllipsis(card) {
+      if (card.timer) {
+        clearInterval(card.timer);
+        card.timer = null;
+      }
+      card.ellipsis.textContent = '';
+    }
+
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const message = input.value.trim();
+      const rawInput = input.value;
+      const message = (procedureMode ? `/procedure ${rawInput}` : rawInput).trim();
       if (!message || busy || !selectedSession) return;
       const sessionId = selectedSession;
-      appendMessage(message, 'user');
+      const isProcedure = PROCEDURE_PATTERN.test(message);
+      const procedureQuery = isProcedure ? (message.match(PROCEDURE_PATTERN)[2] || '').trim() : '';
+
+      if (isProcedure) appendProcedureMessage(procedureQuery);
+      else appendMessage(message, 'user');
       input.value = '';
+      exitProcedureMode();
       setBusy(true);
-      status.textContent = 'Working…';
+      status.textContent = isProcedure ? '' : 'Working…';
+
+      let card = null;
+      if (isProcedure) {
+        card = createProcedureCard();
+        setProcedureLine(card, 'Searching knowledge base');
+        startProcedureEllipsis(card);
+      }
+
       try {
         const response = await fetch(`/api/sessions/${sessionId}/messages`, {
           method: 'POST',
@@ -197,10 +319,20 @@
         if (!response.ok) {
           throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
         }
-        appendMessage(data.response, 'assistant');
+        if (card && data.type === 'procedure_status') {
+          setProcedureLine(card, data.message);
+          if (data.state !== 'kb_found') stopProcedureEllipsis(card);
+        } else {
+          appendMessage(data.response, 'assistant');
+        }
         await refreshSessions();
       } catch (error) {
-        appendMessage(`Error: ${error.message}`, 'error');
+        if (card) {
+          stopProcedureEllipsis(card);
+          setProcedureLine(card, `Error: ${error.message}`);
+        } else {
+          appendMessage(`Error: ${error.message}`, 'error');
+        }
       } finally {
         setBusy(false);
         status.textContent = '';

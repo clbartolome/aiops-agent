@@ -12,6 +12,8 @@ from app.agent import run_agent
 from app.config import load_config
 from app.diagnostics import configure_logging, log_failure
 from app.mcp import MCPConnectionError
+from app.procedure import handle_procedure, is_procedure_command
+from app.procedure.models import ProcedureStatus
 from app.sessions import Conversation, timestamp, visible_messages
 
 
@@ -45,11 +47,24 @@ async def chat(request: ChatRequest) -> dict[str, str]:
     return await send_message(request)
 
 
-async def send_message(request: ChatRequest, session=None) -> dict[str, str]:
+def procedure_payload(status: ProcedureStatus) -> dict:
+    payload = {"type": "procedure_status", "state": status.state, "message": status.message}
+    if status.title:
+        payload["title"] = status.title
+    return payload
+
+
+async def send_message(request: ChatRequest, session=None) -> dict:
     try:
         config = load_config()
     except ValueError:
         raise HTTPException(503, "Check the server's environment configuration.") from None
+
+    # Deterministic, LLM-free routing: only an explicit /procedure prefix
+    # leaves the existing chat/session path. Everything else is unchanged.
+    if is_procedure_command(request.message):
+        return procedure_payload(await handle_procedure(request.message, config))
+
     try:
         response = (await run_agent(request.message, config) if session is None
                     else await run_agent(request.message, config, session=session))
