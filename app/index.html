@@ -104,6 +104,9 @@
     // "/procedure" prefix (followed by whitespace or the end of input) activates
     // procedure mode. No natural-language inference happens here either.
     const PROCEDURE_PATTERN = /^\/procedure(\s(.*))?$/s;
+    // Cosmetic-only delay between sequential procedure stages (e.g. KB found
+    // -> parsing) revealed from a single response; no second request is made.
+    const PROCEDURE_STAGE_DELAY_MS = 500;
     let procedureMode = false;
 
     function enterProcedureMode(remainder) {
@@ -331,7 +334,19 @@
         }
         procedureProgress.hide();
         if (isProcedure && data.type === 'procedure_status') {
-          appendMessage(data.message, 'assistant');
+          // A single /procedure request can produce more than one normal
+          // chat message in sequence (e.g. "KB found: ..." then the parsed
+          // summary). Reveal them one at a time, showing the reusable
+          // transient progress bubble for the next stage in between.
+          const messages = data.messages && data.messages.length ? data.messages : [data.message];
+          for (let index = 0; index < messages.length; index++) {
+            if (index > 0) {
+              procedureProgress.show('Parsing procedure');
+              await new Promise((resolve) => setTimeout(resolve, PROCEDURE_STAGE_DELAY_MS));
+              procedureProgress.hide();
+            }
+            appendMessage(messages[index], 'assistant');
+          }
         } else {
           appendMessage(data.response, 'assistant');
         }

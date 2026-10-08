@@ -43,14 +43,20 @@ async def index() -> str:
 
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest) -> dict[str, str]:
+async def chat(request: ChatRequest) -> dict:
     return await send_message(request)
 
 
 def procedure_payload(status: ProcedureStatus) -> dict:
     # The minimal contract: the final text is always a normal chat message;
     # "state" is kept only in case a later stage needs to branch on it.
-    return {"type": "procedure_status", "state": status.state, "message": status.message}
+    # "messages" is only present when more than one normal chat message is
+    # produced for a single /procedure request (e.g. "KB found: ..." then
+    # the parsed summary); single-message states omit it.
+    payload = {"type": "procedure_status", "state": status.state, "message": status.message}
+    if status.messages:
+        payload["messages"] = list(status.messages)
+    return payload
 
 
 async def send_message(request: ChatRequest, session=None) -> dict:

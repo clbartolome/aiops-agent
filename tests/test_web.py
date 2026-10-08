@@ -72,9 +72,18 @@ def test_page_includes_animated_pending_indicator(agent):
 def test_page_hides_progress_before_showing_the_final_message(agent):
     page = request("GET", "/").text
     # Both the success and the error path hide the transient bubble before
-    # rendering the outcome as a normal chat message, never both at once.
-    assert "procedureProgress.hide();\n        if (isProcedure && data.type === 'procedure_status') {\n          appendMessage(data.message, 'assistant');" in page
+    # rendering the outcome(s) as normal chat message(s), never both at once.
+    assert "procedureProgress.hide();\n        if (isProcedure && data.type === 'procedure_status') {" in page
     assert "procedureProgress.hide();\n        appendMessage(`Error: ${error.message}`, 'error');" in page
+
+
+def test_page_reveals_sequential_procedure_messages_with_progress_between(agent):
+    page = request("GET", "/").text
+    # A single /procedure response can carry more than one chat message
+    # (e.g. "KB found: ..." then the parsed summary); each later one is
+    # revealed after showing the reusable progress bubble again.
+    assert "const messages = data.messages && data.messages.length ? data.messages : [data.message];" in page
+    assert "procedureProgress.show('Parsing procedure');" in page
 
 
 def test_page_skips_progress_for_empty_procedure_command(agent):
@@ -160,6 +169,26 @@ def test_procedure_message_uses_procedure_handler(agent, procedure, config):
     assert response.status_code == 200
     assert response.json() == {"type": "procedure_status", "state": "kb_found", "message": "KB found: Test"}
     procedure.assert_awaited_once_with("/procedure inspect namespace health", config)
+
+
+def test_procedure_payload_includes_messages_when_present(agent, monkeypatch, config):
+    from app.procedure.models import ProcedureStatus
+
+    status = ProcedureStatus(
+        state="parsed",
+        message="Procedure parsed successfully.",
+        messages=("KB found: Inspect namespace health", "Procedure parsed successfully."),
+    )
+    monkeypatch.setattr(web, "handle_procedure", AsyncMock(return_value=status))
+
+    response = request("POST", "/api/chat", json={"message": "/procedure inspect namespace health"})
+    assert response.status_code == 200
+    assert response.json() == {
+        "type": "procedure_status",
+        "state": "parsed",
+        "message": "Procedure parsed successfully.",
+        "messages": ["KB found: Inspect namespace health", "Procedure parsed successfully."],
+    }
     agent.assert_not_awaited()
 
 

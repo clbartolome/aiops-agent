@@ -26,6 +26,48 @@ EXECUTABLE_KB = (
 )
 NON_EXECUTABLE_KB = "# Inspect namespace health\n\nJust a description with no procedure markup."
 
+# A fully valid KB article matching the fixed Markdown format exactly, so the
+# deterministic parser (app.procedure.parser) succeeds end to end.
+VALID_PROCEDURE_KB = """# Inspect namespace health
+
+Inspect the current state of an OpenShift namespace and report basic workload health.
+
+## Procedure
+
+**ID:** inspect-namespace-health
+**Version:** 1
+**Risk:** low
+**Confirmation required:** no
+
+## Required information
+
+- **Namespace** — required — OpenShift namespace to inspect.
+
+## Steps
+
+### 1. Verify that the namespace exists
+
+Check that **Namespace** exists in the OpenShift cluster.
+
+If the namespace does not exist, stop the procedure and inform the user.
+
+### 2. List pods in the namespace
+
+Retrieve all pods running in **Namespace**.
+
+### 3. Review recent events
+
+Retrieve recent events from **Namespace**, including warnings and errors when available.
+
+### 4. Inspect deployments
+
+Retrieve the deployments configured in **Namespace** and their current state.
+
+## Success
+
+The procedure is successful when the namespace exists and the pod, event, and deployment information has been retrieved successfully.
+"""
+
 
 def kb_result(*entries):
     return CallToolResult(content=[
@@ -119,17 +161,62 @@ def test_search_query_extracted_from_command(config, itsm_mcp):
     assert arguments["query"] == "inspect namespace health"
 
 
-# --- Successful KB retrieval --------------------------------------------------
+# --- Successful KB retrieval + deterministic parsing --------------------------
 
-def test_successful_kb_retrieval(config, itsm_mcp):
+def test_successful_kb_retrieval_and_parse(config, itsm_mcp):
+    """End-to-end: /procedure request -> rag_search_kb (once) -> KB found ->
+    parse that exact KB -> ProcedureDefinition -> two sequential chat messages.
+    """
     itsm_mcp.call_tool.return_value = kb_result(
-        {"id": 1, "title": "Inspect namespace health", "description": EXECUTABLE_KB, "score": 0.9},
-        {"id": 2, "title": "Other article", "description": EXECUTABLE_KB, "score": 0.1},
+        {"id": 1, "title": "Inspect namespace health", "description": VALID_PROCEDURE_KB, "score": 0.9},
+        {"id": 2, "title": "Other article", "description": VALID_PROCEDURE_KB, "score": 0.1},
     )
     status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
-    assert status.state == "kb_found"
-    assert status.message == "KB found: Inspect namespace health"
+
+    # rag_search_kb was called exactly once; parsing never re-queries the KB.
+    assert len(itsm_mcp.calls) == 1
+
+    assert status.state == "parsed"
     assert status.title == "Inspect namespace health"
+    assert status.messages == (
+        "KB found: Inspect namespace health",
+        status.message,
+    )
+    assert status.message == (
+        "Procedure parsed successfully.\n"
+        "\n"
+        "Required inputs:\n"
+        "- Namespace\n"
+        "\n"
+        "Steps:\n"
+        "1. Verify that the namespace exists\n"
+        "2. List pods in the namespace\n"
+        "3. Review recent events\n"
+        "4. Inspect deployments"
+    )
+
+
+def test_parse_error_kb_stops_without_falling_back_to_agent(config, itsm_mcp):
+    """A KB with the `## Procedure` marker but invalid/missing metadata must
+    produce a controlled parse error, never fall back to the OperationsAgent.
+    """
+    broken_kb = (
+        "# Inspect namespace health\n\n"
+        "## Procedure\n\n"
+        "**ID:** inspect-namespace-health\n"
+        "**Risk:** low\n"
+        "**Confirmation required:** no\n"
+    )
+    itsm_mcp.call_tool.return_value = kb_result(
+        {"id": 1, "title": "Inspect namespace health", "description": broken_kb, "score": 0.9}
+    )
+    status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    assert status.state == "parse_error"
+    assert status.messages == (
+        "KB found: Inspect namespace health",
+        "Unable to parse the procedure.\n\nMissing required metadata: Version.",
+    )
+    assert status.message == status.messages[1]
 
 
 # --- KB not found -------------------------------------------------------------
