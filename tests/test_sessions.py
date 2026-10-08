@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import httpx
@@ -133,6 +134,27 @@ def test_same_session_requests_are_serialized(monkeypatch):
             release.set()
             assert all(response.status_code == 200 for response in await asyncio.gather(first, second))
             assert calls == 2
+    asyncio.run(scenario())
+
+
+def test_procedure_message_in_a_session_uses_the_same_chat_session(monkeypatch, config):
+    procedure_mock = AsyncMock(return_value="Found an executable procedure article.")
+    monkeypatch.setattr(web, "handle_message", procedure_mock)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=web.app), base_url="http://test") as client:
+            session_id = (await client.post("/api/sessions")).json()["session_id"]
+            response = await client.post(
+                f"/api/sessions/{session_id}/messages",
+                json={"message": "/procedure inspect namespace health"},
+            )
+            assert response.status_code == 200
+            assert response.json() == {"response": procedure_mock.return_value}
+            used_conversation = procedure_mock.call_args.args[2]
+            assert used_conversation is not None and used_conversation.session_id == session_id
+            procedure_mock.assert_awaited_once_with(
+                "/procedure inspect namespace health", config, used_conversation,
+            )
     asyncio.run(scenario())
 
 

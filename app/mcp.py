@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from functools import partial
 from importlib.metadata import version
 import logging
@@ -46,8 +47,26 @@ def create_http_client(headers=None, timeout=None, auth=None, *, verify: bool | 
     return mcp_http.AsyncClient(**options)
 
 
-def create_mcp_servers(configs: tuple[MCPConfig, ...]) -> list[MCPServerStreamableHttp]:
+def create_mcp_servers(
+    configs: tuple[MCPConfig, ...],
+    *,
+    failure_error_function: Callable[..., object] | None = None,
+) -> list[MCPServerStreamableHttp]:
+    """Build the MCP servers shared by every caller (direct agent, procedure
+    KB search, procedure Step Executor): identical client/auth/TLS/transport
+    construction regardless of caller.
+
+    `failure_error_function` is an optional override of the default
+    credential-safe formatter below. It exists so the procedure Step
+    Executor can additionally recognize its own tool-call-boundary safety
+    signals (approval required, out-of-scope, duplicate side effect)
+    without this module knowing anything about procedures; every other
+    caller is unaffected and keeps the exact default formatter.
+    """
     servers = []
+    effective_failure_error_function = failure_error_function or partial(
+        mcp_tool_error, secrets=tuple(c.token for c in configs),
+    )
     for config in configs:
         params = {
             "url": config.url,
@@ -64,6 +83,6 @@ def create_mcp_servers(configs: tuple[MCPConfig, ...]) -> list[MCPServerStreamab
             params=params,
             cache_tools_list=True,
             custom_data_extractor=record_mcp_result,
-            failure_error_function=partial(mcp_tool_error, secrets=tuple(c.token for c in configs)),
+            failure_error_function=effective_failure_error_function,
         ))
     return servers

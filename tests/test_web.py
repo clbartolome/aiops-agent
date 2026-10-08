@@ -7,6 +7,7 @@ from agents import MaxTurnsExceeded
 
 from app import web
 from app.mcp import MCPConnectionError
+from app.procedure import EMPTY_PROCEDURE_REQUEST
 
 
 def request(method, path, **kwargs):
@@ -23,6 +24,16 @@ def agent(monkeypatch, config):
     monkeypatch.setattr(web, "load_config", lambda: config)
     mock = AsyncMock(return_value="The systems are available.")
     monkeypatch.setattr(web, "run_agent", mock)
+    return mock
+
+
+@pytest.fixture
+def procedure(monkeypatch, config):
+    monkeypatch.setattr(web, "load_config", lambda: config)
+    # None means "not procedure-handled": the caller falls through to the agent,
+    # matching handle_message's real contract for ordinary chat messages.
+    mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(web, "handle_message", mock)
     return mock
 
 
@@ -94,3 +105,36 @@ def test_error_logging_omits_response_payload(agent, caplog):
     assert response.status_code == 502
     assert "Unsupported tool choice" in caplog.text
     assert "sensitive-payload" not in caplog.text + response.text
+
+
+def test_direct_chat_uses_existing_operations_agent_path(agent, procedure, config):
+    response = request("POST", "/api/chat", json={"message": "how many pods are running?"})
+    assert response.status_code == 200
+    assert response.json() == {"response": agent.return_value}
+    agent.assert_awaited_once_with("how many pods are running?", config)
+    procedure.assert_awaited_once_with("how many pods are running?", config, None)
+
+
+def test_procedure_message_uses_the_procedure_path(agent, procedure, config):
+    procedure.return_value = "Found an executable procedure article."
+    response = request("POST", "/api/chat", json={"message": "/procedure inspect namespace health"})
+    assert response.status_code == 200
+    assert response.json() == {"response": procedure.return_value}
+    procedure.assert_awaited_once_with("/procedure inspect namespace health", config, None)
+    agent.assert_not_awaited()
+
+
+def test_question_mentioning_procedure_is_not_routed_to_procedure_mode(agent, procedure, config):
+    message = "what is the procedure for inspecting a namespace?"
+    response = request("POST", "/api/chat", json={"message": message})
+    assert response.status_code == 200
+    assert response.json() == {"response": agent.return_value}
+    agent.assert_awaited_once_with(message, config)
+    procedure.assert_awaited_once_with(message, config, None)
+
+
+def test_empty_procedure_command_returns_controlled_validation_response(agent, config):
+    response = request("POST", "/api/chat", json={"message": "/procedure"})
+    assert response.status_code == 200
+    assert response.json() == {"response": EMPTY_PROCEDURE_REQUEST}
+    agent.assert_not_awaited()

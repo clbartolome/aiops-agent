@@ -20,6 +20,7 @@
     #history { padding-top: 20px; }
     .message { margin: 0 0 24px; overflow-wrap: anywhere; }
     .message.user { white-space: pre-wrap; }
+    .message.user.procedure::before { content: 'procedure · '; color: #e3b341; }
     .user, label { color: #8cd8b1; }
     .error { color: #ffb1a8; white-space: pre-wrap; }
     .message.assistant :first-child { margin-top: 0; }
@@ -171,6 +172,7 @@
         line.innerHTML = renderMarkdown(text);
       } else if (role === 'user') {
         line.textContent = `> ${text}`;
+        if (text.trim().toLowerCase().startsWith('/procedure')) line.classList.add('procedure');
       } else {
         line.textContent = text;
       }

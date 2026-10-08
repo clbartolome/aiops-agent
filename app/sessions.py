@@ -18,6 +18,10 @@ class Conversation:
     created_at: str = field(default_factory=timestamp)
     updated_at: str = field(default_factory=timestamp)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # At most one active procedure run per chat session (Step 3). This is a
+    # reference only: LangGraph owns the actual procedure execution state;
+    # the SDK session above still owns conversation history.
+    active_procedure_run_id: str | None = None
     session: SQLiteSession = field(init=False)
 
     def __post_init__(self):

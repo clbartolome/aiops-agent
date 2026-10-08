@@ -7,6 +7,7 @@ from app.agent import run_agent
 from app.config import load_config
 from app.diagnostics import configure_logging
 from app.mcp import MCPConnectionError
+from app.procedure import handle_message
 
 
 def main() -> None:
@@ -15,7 +16,10 @@ def main() -> None:
         config = load_config()
         message = input("> ").strip()
         if message:
-            print(asyncio.run(run_agent(message, config)))
+            response = asyncio.run(handle_message(message, config))
+            if response is None:
+                response = asyncio.run(run_agent(message, config))
+            print(response)
     except (ValueError, MCPConnectionError) as error:
         sys.exit(str(error))
     except MaxTurnsExceeded:
