@@ -15,8 +15,11 @@ The flow for this iteration is:
         -> apply declared defaults -> extract input values from the
         original request -> determine missing required inputs
         -> ask only for what is missing -> repeat on each reply
-        -> READY -> execute procedure.steps[0] only -> store the result
-        -> show it in chat -> stop (no further step is executed yet)
+        -> READY -> execute procedure.steps[0]
+        -> if and only if that succeeds, execute procedure.steps[1],
+           giving it step 1's result as compact previous-step context
+        -> store each result -> show each in chat -> stop
+           (no step beyond steps[1] is executed yet)
 
 The KB is retrieved exactly once via the fixed `rag_search_kb` MCP tool; the
 retrieved title/content is parsed deterministically with plain Python (see
@@ -24,10 +27,11 @@ retrieved title/content is parsed deterministically with plain Python (see
 a small, tool-less, structured-output model call (see
 `app.procedure.extractor`), but which inputs are declared, which are
 missing, and when the procedure is READY is always decided by plain Python
-— never by the model. Once READY, exactly the first procedure step is
-executed by a dedicated Step Executor (see `app.procedure.executor`); which
-step runs is always decided by plain Python (`procedure.steps[0]`), never
-by the model.
+— never by the model. Once READY, each step is executed in turn by the same
+dedicated Step Executor (see `app.procedure.executor`); which step runs,
+and whether a next step runs at all, is always decided here in plain
+Python from `StepResult.status` (`procedure.steps[0]`, then `steps[1]`),
+never by the model.
 """
 import json
 import logging
@@ -43,7 +47,7 @@ from app.procedure.executor import execute_step
 from app.procedure.extractor import extract_procedure_inputs
 from app.procedure.models import (
     KBResult, PrimitiveValue, ProcedureContext, ProcedureDefinition, ProcedureInput, ProcedureStep,
-    ProcedureRequest, ProcedureStatus, StepResult,
+    ProcedureRequest, ProcedureStatus, StepExecutionContext, StepResult,
 )
 from app.procedure.parser import ProcedureParseError, coerce_primitive, parse_procedure
 
@@ -214,48 +218,89 @@ def _secrets(config: Config) -> tuple[str | None, ...]:
     return (config.model_api_key, *(server.token for server in config.mcp_servers))
 
 
-# --- Step execution: exactly `procedure.steps[0]`, never chosen by the model
+# --- Step execution: exactly `procedure.steps[0]`, then -- only on SUCCESS
+# -- `procedure.steps[1]`. The model never chooses, skips, or reorders
+# steps; this module alone decides which step(s) run, from `StepResult.status`.
 
 STEP_RESULT_MESSAGE_PREFIX = {
     "SUCCESS": "Step completed", "STOP": "Step stopped the procedure", "FAILED": "Step failed",
 }
-STEP_RESULT_CONTEXT_STATUS = {
-    "SUCCESS": "FIRST_STEP_COMPLETED", "STOP": "STOPPED", "FAILED": "FAILED",
-}
 STEP_EXECUTION_ERROR_SUMMARY = "Unable to complete this step."
+
+# How many steps have run so far decides the terminal SUCCESS context
+# status label; STOP/FAILED are the same regardless of which step produced
+# them (which step is still available from `step_results`).
+_SUCCESS_CONTEXT_STATUS_BY_STEP_INDEX = {0: "FIRST_STEP_COMPLETED", 1: "SECOND_STEP_COMPLETED"}
 
 
 def _step_result_message(step: ProcedureStep, result: StepResult) -> str:
     return f"{STEP_RESULT_MESSAGE_PREFIX[result.status]}: {step.title}\n\n{result.summary}"
 
 
-async def _execute_first_step(context: ProcedureContext, config: Config) -> tuple[str, str, ProcedureContext]:
-    """Execute `procedure.steps[0]` only and return (progress label, user
-    message, updated context). Only called once `context.status == "READY"`.
+def _context_status_for_result(result: StepResult, step_index: int) -> str:
+    if result.status == "STOP":
+        return "STOPPED"
+    if result.status == "FAILED":
+        return "FAILED"
+    return _SUCCESS_CONTEXT_STATUS_BY_STEP_INDEX.get(step_index, "FIRST_STEP_COMPLETED")
 
-    The procedure definition alone decides which step runs; this never asks
-    the model to choose, skip, or reorder steps. No further step is
-    executed after this one (not implemented yet).
+
+async def _run_one_step(
+    context: ProcedureContext, step: ProcedureStep, previous_results: list[StepExecutionContext], config: Config,
+) -> tuple[str, str, StepResult, ProcedureContext]:
+    """Execute exactly the one given step and return (progress label, user
+    message, its `StepResult`, updated context). `previous_results` is
+    compact already-completed-step context (title/status/summary only);
+    it never changes which step runs, only what this one step is told.
     """
     procedure = context.procedure
-    step = procedure.steps[0]
     progress_stage = f"Running: {step.title}..."
 
     try:
         result = await execute_step(
             context.run_id, step, procedure.inputs, context.inputs, context.original_request, config,
+            previous_results=previous_results,
         )
     except Exception as error:
         log_failure(logger, f"Procedure run={context.run_id} step={step.id} execution failed", error, _secrets(config))
         result = StepResult(status="FAILED", summary=STEP_EXECUTION_ERROR_SUMMARY)
 
     message = _step_result_message(step, result)
+    step_index = procedure.steps.index(step)
     new_context = context.model_copy(update={
-        "status": STEP_RESULT_CONTEXT_STATUS[result.status],
+        "status": _context_status_for_result(result, step_index),
+        # Never overwrite an earlier step's stored result; preserve order.
         "step_results": {**context.step_results, step.id: result},
-        "current_step_index": 0,
+        "current_step_index": step_index,
     })
-    return progress_stage, message, new_context
+    return progress_stage, message, result, new_context
+
+
+async def _execute_first_steps(
+    context: ProcedureContext, config: Config,
+) -> tuple[tuple[str, ...], tuple[str, ...], ProcedureContext]:
+    """Execute `procedure.steps[0]`, and -- only if it returns SUCCESS and
+    a second step exists -- also `procedure.steps[1]`, passing step 1's
+    result to step 2 as compact previous-step context. Only called once
+    `context.status == "READY"`. No step beyond `steps[1]` is executed
+    this iteration (the generic N-step loop is not implemented yet).
+    """
+    procedure = context.procedure
+    step_1 = procedure.steps[0]
+    stage_1, message_1, result_1, context_1 = await _run_one_step(context, step_1, [], config)
+
+    stages, messages, final_context = (stage_1,), (message_1,), context_1
+
+    if result_1.status == "SUCCESS" and len(procedure.steps) > 1:
+        step_2 = procedure.steps[1]
+        logger.info("Procedure run=%s next_step=%s", context.run_id, step_2.id)
+        previous_results = [StepExecutionContext(step=step_1, result=result_1)]
+        stage_2, message_2, _result_2, context_2 = await _run_one_step(context_1, step_2, previous_results, config)
+        stages += (stage_2,)
+        messages += (message_2,)
+        final_context = context_2
+
+    return stages, messages, final_context
 
 
 async def _extract_and_merge(
@@ -285,8 +330,9 @@ async def _settle(context: ProcedureContext, collected: dict[str, PrimitiveValue
                    extraction_failed: bool, failed_targets: list[ProcedureInput], config: Config) -> ProcedureStatus:
     """Compute missing inputs deterministically and build the final status:
     asking for what remains, or -- once READY -- immediately executing
-    `procedure.steps[0]` and folding its result into the response as an
-    additional sequential chat message (see `_execute_first_step`).
+    `procedure.steps[0]` (and, on SUCCESS, `procedure.steps[1]`) and
+    folding each step's result into the response as an additional
+    sequential chat message (see `_execute_first_steps`).
     """
     procedure = context.procedure
     missing = _missing_required(procedure, collected)
@@ -305,12 +351,12 @@ async def _settle(context: ProcedureContext, collected: dict[str, PrimitiveValue
     ready_message = _ready_message(procedure, collected)
     ready_context = context.model_copy(update={"inputs": collected, "status": "READY"})
 
-    progress_stage, step_message, final_context = await _execute_first_step(ready_context, config)
+    stages, step_messages, final_context = await _execute_first_steps(ready_context, config)
     logger.info("Procedure run=%s status=%s", context.run_id, final_context.status)
 
     return ProcedureStatus(
-        state=final_context.status.lower(), message=step_message, title=context.kb_title,
-        messages=(ready_message, step_message), progress_stages=(progress_stage,),
+        state=final_context.status.lower(), message=step_messages[-1], title=context.kb_title,
+        messages=(ready_message, *step_messages), progress_stages=stages,
         context=final_context,
     )
 

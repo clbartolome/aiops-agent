@@ -1,4 +1,10 @@
-"""Dedicated Step Executor: executes exactly one procedure step.
+"""Dedicated Step Executor: executes exactly one procedure step at a time.
+
+The orchestration layer (`app.procedure`) decides, in plain Python, which
+step runs and when (e.g. `procedure.steps[0]`, then -- only on SUCCESS --
+`procedure.steps[1]`), and may pass already-completed steps' results as
+compact context via `previous_results`. This module never decides which
+step to execute next; it only executes the one step it is given.
 
 Reuses the same OpenAI Agents SDK + MCP integration already used by the
 main `OperationsAgent` (`app.agent`): the same `create_mcp_servers`/
@@ -48,7 +54,9 @@ from app.agent import ToolDiagnostics
 from app.config import MAX_TURNS, Config
 from app.diagnostics import ProtocolTextError, log_failure
 from app.mcp import MCPConnectionError, create_mcp_servers
-from app.procedure.models import PrimitiveValue, ProcedureInput, ProcedureStep, StepResult
+from app.procedure.models import (
+    PrimitiveValue, ProcedureInput, ProcedureStep, StepExecutionContext, StepResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,15 +119,30 @@ def _resolved_inputs_block(declared: list[ProcedureInput], collected: dict[str, 
     return "\n".join(lines) if lines else "(none)"
 
 
+def format_previous_step_results(previous_results: list[StepExecutionContext]) -> str:
+    """Deterministically format already-completed steps as compact context
+    for the next step's prompt (title, status, summary only -- never raw
+    MCP payloads). No LLM is involved in producing this text.
+    """
+    lines = ["Previous completed steps:", ""]
+    for item in previous_results:
+        lines.append(f"- {item.step.title}")
+        lines.append(f"  Status: {item.result.status}")
+        lines.append(f"  Summary: {item.result.summary}")
+    return "\n".join(lines)
+
+
 def _operational_prompt(
     step: ProcedureStep, declared: list[ProcedureInput], collected: dict[str, PrimitiveValue],
-    original_request: str,
+    original_request: str, previous_results: list[StepExecutionContext],
 ) -> str:
     lines = [
         f"Step title: {step.title}", "",
         f"Instruction:\n{step.instruction}", "",
         f"Resolved inputs:\n{_resolved_inputs_block(declared, collected)}",
     ]
+    if previous_results:
+        lines += ["", format_previous_step_results(previous_results)]
     if original_request:
         lines += ["", f"Original procedure request:\n{original_request}"]
     return "\n".join(lines)
@@ -127,7 +150,7 @@ def _operational_prompt(
 
 async def _run_operational_phase(
     run_id: str, step: ProcedureStep, declared: list[ProcedureInput], collected: dict[str, PrimitiveValue],
-    original_request: str, config: Config,
+    original_request: str, config: Config, previous_results: list[StepExecutionContext],
 ) -> tuple[str, _StepEvidence]:
     """Run the real, tool-using step agent. Returns (free-text conclusion, evidence).
 
@@ -157,7 +180,7 @@ async def _run_operational_phase(
             mcp_config={"include_server_in_tool_names": True},
             model_settings=ModelSettings(tool_choice="auto"),
         )
-        prompt = _operational_prompt(step, declared, collected, original_request)
+        prompt = _operational_prompt(step, declared, collected, original_request, previous_results)
         try:
             result = await Runner.run(
                 agent, prompt, max_turns=MAX_TURNS, hooks=ToolDiagnostics(),
@@ -216,21 +239,31 @@ async def _classify_result(step: ProcedureStep, conclusion: str, config: Config)
 
 async def execute_step(
     run_id: str, step: ProcedureStep, declared: list[ProcedureInput], collected: dict[str, PrimitiveValue],
-    original_request: str, config: Config,
+    original_request: str, config: Config, previous_results: list[StepExecutionContext] | None = None,
 ) -> StepResult:
     """Execute exactly one procedure step and return a validated `StepResult`.
 
-    The caller always supplies `step` (normally `procedure.steps[0]`); this
-    function never selects which step to run and never executes more than
-    one. Tool selection within the step is fully agentic -- the model is
-    never told which MCP tool to call.
+    The caller always supplies `step` (e.g. `procedure.steps[0]`, or
+    `procedure.steps[1]` once step 1 succeeds); this function never
+    selects which step to run and never executes more than one. Tool
+    selection within the step is fully agentic -- the model is never told
+    which MCP tool to call.
+
+    `previous_results`, when given, carries already-completed steps as
+    compact context (title/status/summary only); it never changes which
+    step is executed, only what context this one step sees.
 
     A self-reported SUCCESS/STOP without any successful live MCP evidence
     is rejected and converted to FAILED; this is decided here in plain
     Python, never by the model.
     """
-    logger.info("Procedure run=%s step=%s status=starting", run_id, step.id)
-    conclusion, evidence = await _run_operational_phase(run_id, step, declared, collected, original_request, config)
+    previous_results = previous_results or []
+    logger.info(
+        "Procedure run=%s step=%s previous_results=%d status=starting", run_id, step.id, len(previous_results),
+    )
+    conclusion, evidence = await _run_operational_phase(
+        run_id, step, declared, collected, original_request, config, previous_results,
+    )
 
     if not conclusion:
         result = StepResult(status="FAILED", summary=FAILED_PROTOCOL_ERROR_SUMMARY)

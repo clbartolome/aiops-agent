@@ -5,8 +5,9 @@ iterations). The parsed-procedure types are small Pydantic models, kept
 intentionally free of any MCP-specific concepts (no tool/server/system
 names) so the KB stays independent from concrete MCP implementations.
 
-Only the first procedure step is executed so far (see
-`app.procedure.executor`); the full step loop is not implemented yet.
+Only `procedure.steps[0]` and, if it succeeds, `procedure.steps[1]` are
+executed so far (see `app.procedure.executor`); the full step loop is not
+implemented yet.
 """
 from dataclasses import dataclass
 from typing import Literal
@@ -124,6 +125,23 @@ class StepResult(BaseModel):
     summary: str
 
 
+class StepExecutionContext:
+    """Minimal previous-step context passed to the Step Executor for
+    chaining: just enough for the model to understand what already
+    happened (title, status, summary) -- never raw MCP payloads. Real MCP
+    evidence stays in application code (see `app.procedure.executor`).
+
+    A plain object (not a Pydantic model): this is internal plumbing
+    between orchestration and the Step Executor, never serialized.
+    """
+
+    __slots__ = ("step", "result")
+
+    def __init__(self, step: ProcedureStep, result: StepResult):
+        self.step = step
+        self.result = result
+
+
 class ProcedureContext(BaseModel):
     """The active `/procedure` run retained on a chat session between turns.
 
@@ -131,10 +149,13 @@ class ProcedureContext(BaseModel):
     plus anything deterministically validated from extraction).
 
     `status` tracks progress: input collection (`COLLECTING_INPUTS`,
-    `READY`), the outcome of executing the first step
-    (`FIRST_STEP_COMPLETED`, `STOPPED`, `FAILED`), or `CANCELLED`. Only the
-    first step is ever executed so far; `current_step_index` stays `0` and
-    `step_results` has at most one entry this iteration.
+    `READY`), the outcome of executing the first/second step
+    (`FIRST_STEP_COMPLETED`, `SECOND_STEP_COMPLETED`, `STOPPED`, `FAILED`),
+    or `CANCELLED`. Only `procedure.steps[0]` and, if it succeeds,
+    `procedure.steps[1]` are ever executed so far; `current_step_index`
+    tracks the index of the last step executed and `step_results` holds
+    at most two entries this iteration, keyed by step id and never
+    overwriting an earlier step's stored result.
     """
 
     run_id: str
@@ -144,7 +165,8 @@ class ProcedureContext(BaseModel):
     procedure: ProcedureDefinition
     inputs: dict[str, PrimitiveValue] = {}
     status: Literal[
-        "COLLECTING_INPUTS", "READY", "FIRST_STEP_COMPLETED", "STOPPED", "FAILED", "CANCELLED",
+        "COLLECTING_INPUTS", "READY", "FIRST_STEP_COMPLETED", "SECOND_STEP_COMPLETED",
+        "STOPPED", "FAILED", "CANCELLED",
     ] = "COLLECTING_INPUTS"
     step_results: dict[str, StepResult] = {}
     current_step_index: int = 0

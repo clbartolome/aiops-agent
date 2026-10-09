@@ -18,12 +18,17 @@ from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessa
 
 from app.procedure.executor import (
     CLASSIFIER_INSTRUCTIONS, FAILED_NO_EVIDENCE_SUMMARY, STEP_EXECUTOR_INSTRUCTIONS, execute_step,
+    format_previous_step_results,
 )
-from app.procedure.models import ProcedureInput, ProcedureStep
+from app.procedure.models import ProcedureInput, ProcedureStep, StepExecutionContext, StepResult
 
 STEP = ProcedureStep(
     id="verify_that_the_namespace_exists", title="Verify that the namespace exists",
     instruction="Check that Namespace exists. If it does not exist, stop the procedure.",
+)
+STEP_2 = ProcedureStep(
+    id="list_pods_in_the_namespace", title="List pods in the namespace",
+    instruction="Retrieve all pods running in Namespace.",
 )
 DECLARED = [ProcedureInput(name="namespace", label="Namespace", required=True)]
 COLLECTED = {"namespace": "payments"}
@@ -251,3 +256,78 @@ def test_protocol_error_during_operational_phase_yields_failed(model, config, mc
     result = asyncio.run(execute_step("run-1", STEP, DECLARED, COLLECTED, "", config))
     assert result.status == "FAILED"
     assert "<|" not in result.summary
+
+
+# --- previous_results plumbing (chaining step 1's result into step 2) ------
+
+def test_format_previous_step_results_is_deterministic_and_compact():
+    """A plain Python helper, not an LLM call: given the same inputs it
+    always produces the same compact text.
+    """
+    previous = [StepExecutionContext(
+        step=STEP, result=StepResult(status="SUCCESS", summary="Namespace payments exists."),
+    )]
+
+    text = format_previous_step_results(previous)
+
+    assert text == (
+        "Previous completed steps:\n\n"
+        "- Verify that the namespace exists\n"
+        "  Status: SUCCESS\n"
+        "  Summary: Namespace payments exists."
+    )
+
+
+def test_previous_results_reach_the_step_2_prompt(model, config, mcp_boundary):
+    """Step 2's prompt includes step 1's title/status/summary as compact
+    context, alongside its own title/instruction/resolved inputs -- never
+    future steps, never the full chat history.
+    """
+    captured = {}
+    previous = [StepExecutionContext(
+        step=STEP, result=StepResult(status="SUCCESS", summary="Namespace payments exists."),
+    )]
+
+    def respond(**kwargs):
+        if is_operational(kwargs):
+            if model.await_count == 1:
+                captured["prompt"] = str(kwargs["input"])
+                return call(exposed_name(kwargs["tools"], "openshift", "get_pod_count"),
+                            {"namespace": "payments"})
+            return answer("Found 8 pods in namespace payments.")
+        assert is_classifier(kwargs)
+        return structured_answer("SUCCESS", "Found 8 pods in namespace payments.")
+
+    model.side_effect = respond
+    result = asyncio.run(execute_step(
+        "run-1", STEP_2, DECLARED, COLLECTED, "", config, previous_results=previous,
+    ))
+
+    assert result.status == "SUCCESS"
+    prompt = captured["prompt"]
+    assert STEP_2.title in prompt
+    assert STEP_2.instruction in prompt
+    assert "Namespace = payments" in prompt
+    assert "Previous completed steps:" in prompt
+    assert STEP.title in prompt
+    assert "Status: SUCCESS" in prompt
+    assert "Summary: Namespace payments exists." in prompt
+
+
+def test_no_previous_results_omits_the_section_entirely(model, config, mcp_boundary):
+    """Step 1 (no prior steps) must not render an empty "Previous completed
+    steps:" section at all.
+    """
+    captured = {}
+
+    def respond(**kwargs):
+        if is_operational(kwargs):
+            captured["prompt"] = str(kwargs["input"])
+            return answer("Namespace payments exists.")
+        assert is_classifier(kwargs)
+        return structured_answer("SUCCESS", "Namespace payments exists.")
+
+    model.side_effect = respond
+    asyncio.run(execute_step("run-1", STEP, DECLARED, COLLECTED, "", config, previous_results=[]))
+
+    assert "Previous completed steps" not in captured["prompt"]

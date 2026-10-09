@@ -348,7 +348,7 @@ def test_cancel_clears_the_active_procedure(agent, procedure_lifecycle, config):
     procedure_lifecycle.reply.assert_not_awaited()
 
 
-@pytest.mark.parametrize("terminal_status", ["FIRST_STEP_COMPLETED", "STOPPED", "FAILED"])
+@pytest.mark.parametrize("terminal_status", ["FIRST_STEP_COMPLETED", "SECOND_STEP_COMPLETED", "STOPPED", "FAILED"])
 def test_after_step_execution_normal_chat_is_not_consumed(agent, procedure_lifecycle, config, terminal_status):
     """After the first step's outcome (success, stop, or failure), the
     procedure is no longer actively waiting on input; the next plain
@@ -400,6 +400,36 @@ def test_step_execution_payload_includes_the_full_message_sequence(agent, monkey
     # Step 2's title never appears anywhere in the payload (it is never run).
     assert "List pods" not in str(payload)
     agent.assert_not_awaited()
+
+
+def test_step_execution_payload_includes_both_steps_when_step_2_also_runs(agent, monkeypatch, config):
+    """Once step 2 also runs (step 1 SUCCESS), its stage/message are simply
+    additional entries in the same sequence -- no new transport or payload
+    shape is introduced for the second step either.
+    """
+    from app.procedure.models import ProcedureStatus
+
+    status = ProcedureStatus(
+        state="second_step_completed",
+        message="Step completed: List pods in the namespace\n\nFound 8 pods in namespace payments.",
+        messages=(
+            "Inputs collected:\n\n- Namespace: payments\n\nProcedure is ready to execute.",
+            "Step completed: Verify that the namespace exists\n\nNamespace payments exists.",
+            "Step completed: List pods in the namespace\n\nFound 8 pods in namespace payments.",
+        ),
+        progress_stages=("Running: Verify that the namespace exists...", "Running: List pods in the namespace..."),
+    )
+    monkeypatch.setattr(web, "handle_procedure", AsyncMock(return_value=status))
+
+    response = request("POST", "/api/chat", json={"message": "/procedure inspect namespace health for payments"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["state"] == "second_step_completed"
+    assert len(payload["messages"]) == 3
+    assert len(payload["progress_stages"]) == len(payload["messages"]) - 1
+    assert payload["progress_stages"][-1] == "Running: List pods in the namespace..."
+    assert payload["messages"][-1] == "Step completed: List pods in the namespace\n\nFound 8 pods in namespace payments."
+    assert "Review recent events" not in str(payload)
 
 
 def test_procedure_context_never_appears_in_the_response(agent, procedure_lifecycle, config):
