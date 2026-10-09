@@ -20,7 +20,7 @@ from mcp.types import CallToolResult, TextContent
 
 import app.procedure as procedure_module
 from app.procedure import handle_cancel, handle_procedure, handle_procedure_input_reply
-from app.procedure.models import ProcedureContext
+from app.procedure.models import ProcedureContext, StepResult
 
 # A single required input, no default.
 KB_SINGLE_INPUT = """# Inspect namespace health
@@ -145,6 +145,19 @@ def extractor(monkeypatch):
     return mock
 
 
+@pytest.fixture
+def step_executor(monkeypatch):
+    """Mock the Step Executor; tests set `.return_value`/`.side_effect`.
+
+    Defaults to a successful step so tests that reach READY (and therefore
+    trigger step-1 execution) do not need to care about it unless they are
+    specifically testing step execution. Never calls a real model/MCP tool.
+    """
+    mock = AsyncMock(return_value=StepResult(status="SUCCESS", summary="Step completed."))
+    monkeypatch.setattr(procedure_module, "execute_step", mock)
+    return mock
+
+
 def start_procedure(config, itsm_mcp, kb_content, title="Validate application state"):
     itsm_mcp.call_tool.return_value = kb_result(
         {"id": 1, "title": title, "description": kb_content, "score": 0.9}
@@ -166,7 +179,7 @@ def make_context(kb_content: str, inputs: dict | None = None, status: str = "COL
 
 # --- Value already present in the original /procedure request --------------
 
-def test_value_already_in_request_asks_nothing(config, itsm_mcp, extractor):
+def test_value_already_in_request_asks_nothing(config, itsm_mcp, extractor, step_executor):
     start_procedure(config, itsm_mcp, KB_SINGLE_INPUT)
     extractor.return_value = {"namespace": "payments"}
 
@@ -174,12 +187,14 @@ def test_value_already_in_request_asks_nothing(config, itsm_mcp, extractor):
         "/procedure inspect namespace health for namespace payments", config,
     ))
 
-    assert status.state == "ready"
+    # Once READY, step 1 is executed automatically within the same call
+    # (see the step-execution tests below); the "ready" message is still
+    # shown as an intermediate sequential message.
+    assert status.state == "first_step_completed"
     assert status.context.inputs == {"namespace": "payments"}
     assert "What namespace" not in status.message
-    assert status.message == (
-        "Inputs collected:\n\n- Namespace: payments\n\nProcedure is ready to execute."
-    )
+    assert "Inputs collected:\n\n- Namespace: payments\n\nProcedure is ready to execute." in status.messages
+    assert status.message == "Step completed: Verify that the namespace exists\n\nStep completed."
 
 
 # --- Missing input ------------------------------------------------------------
@@ -198,21 +213,21 @@ def test_missing_input_is_asked(config, itsm_mcp, extractor):
 
 # --- Single-value reply: deterministic shortcut, no LLM ---------------------
 
-def test_single_value_reply_uses_no_llm_shortcut(config, extractor):
+def test_single_value_reply_uses_no_llm_shortcut(config, extractor, step_executor):
     context = make_context(KB_SINGLE_INPUT, inputs={}, status="COLLECTING_INPUTS")
 
     status = asyncio.run(handle_procedure_input_reply("payments", context, config))
 
     extractor.assert_not_awaited()
-    assert status.state == "ready"
+    assert status.state == "first_step_completed"
     assert status.context.inputs == {"namespace": "payments"}
-    assert status.context.status == "READY"
+    assert status.context.status == "FIRST_STEP_COMPLETED"
     assert status.context.run_id == context.run_id
 
 
 # --- Multiple values already in the original request ------------------------
 
-def test_multiple_values_in_original_request(config, itsm_mcp, extractor):
+def test_multiple_values_in_original_request(config, itsm_mcp, extractor, step_executor):
     start_procedure(config, itsm_mcp, KB_TWO_INPUTS)
     extractor.return_value = {"namespace": "payments", "application_name": "checkout"}
 
@@ -220,7 +235,7 @@ def test_multiple_values_in_original_request(config, itsm_mcp, extractor):
         "/procedure inspect checkout in namespace payments", config,
     ))
 
-    assert status.state == "ready"
+    assert status.state == "first_step_completed"
     assert status.context.inputs == {"namespace": "payments", "application_name": "checkout"}
 
 
@@ -242,7 +257,7 @@ def test_partial_original_request_asks_only_remaining(config, itsm_mcp, extracto
 
 # --- Multi-field natural reply ------------------------------------------------
 
-def test_multi_field_reply_extracts_both_and_becomes_ready(config, extractor):
+def test_multi_field_reply_extracts_both_and_becomes_ready(config, extractor, step_executor):
     context = make_context(KB_TWO_INPUTS, inputs={}, status="COLLECTING_INPUTS")
     extractor.return_value = {"namespace": "payments", "application_name": "checkout"}
 
@@ -255,7 +270,7 @@ def test_multi_field_reply_extracts_both_and_becomes_ready(config, extractor):
     assert called_args[0] == "namespace is payments and the app is checkout"
     assert {item.name for item in called_args[1]} == {"namespace", "application_name"}
 
-    assert status.state == "ready"
+    assert status.state == "first_step_completed"
     assert status.context.inputs == {"namespace": "payments", "application_name": "checkout"}
 
 
@@ -304,7 +319,7 @@ def test_unknown_extractor_field_is_rejected(config, extractor):
 
 # --- Defaults ------------------------------------------------------------------
 
-def test_declared_defaults_are_applied_before_extraction(config, itsm_mcp, extractor):
+def test_declared_defaults_are_applied_before_extraction(config, itsm_mcp, extractor, step_executor):
     start_procedure(config, itsm_mcp, KB_WITH_DEFAULT)
     extractor.return_value = {"namespace": "payments"}
 
@@ -312,10 +327,11 @@ def test_declared_defaults_are_applied_before_extraction(config, itsm_mcp, extra
 
     # The default was applied deterministically before extraction ran at all.
     assert status.context.inputs["minimum_pod_count"] == 1
-    assert status.state == "ready"
-    # No question was ever asked about it; it is only shown for visibility.
-    assert "should I use" not in status.message
-    assert "Minimum pod count: 1" in status.message
+    assert status.state == "first_step_completed"
+    # No question was ever asked about it; it is only shown for visibility,
+    # in the intermediate "ready" message (step 1 now runs automatically).
+    assert not any("should I use" in message for message in status.messages)
+    assert any("Minimum pod count: 1" in message for message in status.messages)
 
 
 def test_optional_input_with_default_is_never_asked(config, itsm_mcp, extractor):
@@ -331,7 +347,7 @@ def test_optional_input_with_default_is_never_asked(config, itsm_mcp, extractor)
 
 # --- Resume same procedure context -------------------------------------------
 
-def test_reply_updates_same_context_not_a_new_one(config, extractor):
+def test_reply_updates_same_context_not_a_new_one(config, extractor, step_executor):
     context = make_context(KB_TWO_INPUTS, inputs={"namespace": "payments"}, status="COLLECTING_INPUTS",
                             run_id="existing-run")
     extractor.return_value = {}
@@ -400,15 +416,18 @@ def test_cancel_clears_context():
 
 # --- No step execution / no operational MCP tool calls -----------------------
 
-def test_no_openshift_or_aap_tool_is_ever_called(config, itsm_mcp, extractor):
-    """Only the fixed `rag_search_kb` ITSM tool may be called; no operational
-    OpenShift/AAP MCP tool call happens during input collection.
+def test_no_openshift_or_aap_tool_is_ever_called(config, itsm_mcp, extractor, step_executor):
+    """Only the fixed `rag_search_kb` ITSM tool may be called during KB
+    retrieval and input collection; the Step Executor (mocked here, see
+    `tests/test_procedure_executor.py` for its own MCP-level tests) is a
+    separate, dedicated path for any operational MCP tool use.
     """
     start_procedure(config, itsm_mcp, KB_TWO_INPUTS)
     extractor.return_value = {"namespace": "payments", "application_name": "checkout"}
 
     status = asyncio.run(handle_procedure("/procedure inspect checkout in namespace payments", config))
-    assert status.state == "ready"
+    assert status.state == "first_step_completed"
 
-    # The only MCP tool call observed anywhere is the fixed KB search.
+    # The only MCP tool call observed anywhere in input collection is the fixed KB search.
     assert itsm_mcp.calls == [("rag_search_kb", {"query": "inspect checkout in namespace payments"})]
+    step_executor.assert_awaited_once()

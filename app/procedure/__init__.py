@@ -15,7 +15,8 @@ The flow for this iteration is:
         -> apply declared defaults -> extract input values from the
         original request -> determine missing required inputs
         -> ask only for what is missing -> repeat on each reply
-        -> READY (no step execution yet)
+        -> READY -> execute procedure.steps[0] only -> store the result
+        -> show it in chat -> stop (no further step is executed yet)
 
 The KB is retrieved exactly once via the fixed `rag_search_kb` MCP tool; the
 retrieved title/content is parsed deterministically with plain Python (see
@@ -23,7 +24,10 @@ retrieved title/content is parsed deterministically with plain Python (see
 a small, tool-less, structured-output model call (see
 `app.procedure.extractor`), but which inputs are declared, which are
 missing, and when the procedure is READY is always decided by plain Python
-— never by the model.
+— never by the model. Once READY, exactly the first procedure step is
+executed by a dedicated Step Executor (see `app.procedure.executor`); which
+step runs is always decided by plain Python (`procedure.steps[0]`), never
+by the model.
 """
 import json
 import logging
@@ -35,10 +39,11 @@ from agents.mcp import MCPServerManager
 from app.config import Config
 from app.diagnostics import log_failure
 from app.mcp import create_mcp_servers
+from app.procedure.executor import execute_step
 from app.procedure.extractor import extract_procedure_inputs
 from app.procedure.models import (
-    KBResult, PrimitiveValue, ProcedureContext, ProcedureDefinition, ProcedureInput,
-    ProcedureRequest, ProcedureStatus,
+    KBResult, PrimitiveValue, ProcedureContext, ProcedureDefinition, ProcedureInput, ProcedureStep,
+    ProcedureRequest, ProcedureStatus, StepResult,
 )
 from app.procedure.parser import ProcedureParseError, coerce_primitive, parse_procedure
 
@@ -209,6 +214,50 @@ def _secrets(config: Config) -> tuple[str | None, ...]:
     return (config.model_api_key, *(server.token for server in config.mcp_servers))
 
 
+# --- Step execution: exactly `procedure.steps[0]`, never chosen by the model
+
+STEP_RESULT_MESSAGE_PREFIX = {
+    "SUCCESS": "Step completed", "STOP": "Step stopped the procedure", "FAILED": "Step failed",
+}
+STEP_RESULT_CONTEXT_STATUS = {
+    "SUCCESS": "FIRST_STEP_COMPLETED", "STOP": "STOPPED", "FAILED": "FAILED",
+}
+STEP_EXECUTION_ERROR_SUMMARY = "Unable to complete this step."
+
+
+def _step_result_message(step: ProcedureStep, result: StepResult) -> str:
+    return f"{STEP_RESULT_MESSAGE_PREFIX[result.status]}: {step.title}\n\n{result.summary}"
+
+
+async def _execute_first_step(context: ProcedureContext, config: Config) -> tuple[str, str, ProcedureContext]:
+    """Execute `procedure.steps[0]` only and return (progress label, user
+    message, updated context). Only called once `context.status == "READY"`.
+
+    The procedure definition alone decides which step runs; this never asks
+    the model to choose, skip, or reorder steps. No further step is
+    executed after this one (not implemented yet).
+    """
+    procedure = context.procedure
+    step = procedure.steps[0]
+    progress_stage = f"Running: {step.title}..."
+
+    try:
+        result = await execute_step(
+            context.run_id, step, procedure.inputs, context.inputs, context.original_request, config,
+        )
+    except Exception as error:
+        log_failure(logger, f"Procedure run={context.run_id} step={step.id} execution failed", error, _secrets(config))
+        result = StepResult(status="FAILED", summary=STEP_EXECUTION_ERROR_SUMMARY)
+
+    message = _step_result_message(step, result)
+    new_context = context.model_copy(update={
+        "status": STEP_RESULT_CONTEXT_STATUS[result.status],
+        "step_results": {**context.step_results, step.id: result},
+        "current_step_index": 0,
+    })
+    return progress_stage, message, new_context
+
+
 async def _extract_and_merge(
     run_id: str, text: str, targets: list[ProcedureInput], collected: dict[str, PrimitiveValue],
     config: Config,
@@ -232,27 +281,37 @@ async def _extract_and_merge(
     return merged, False
 
 
-def _settle(context: ProcedureContext, collected: dict[str, PrimitiveValue],
-            extraction_failed: bool, failed_targets: list[ProcedureInput]) -> ProcedureStatus:
-    """Compute missing inputs deterministically and build the final status
-    (asking for what remains, or READY) plus the context to persist.
+async def _settle(context: ProcedureContext, collected: dict[str, PrimitiveValue],
+                   extraction_failed: bool, failed_targets: list[ProcedureInput], config: Config) -> ProcedureStatus:
+    """Compute missing inputs deterministically and build the final status:
+    asking for what remains, or -- once READY -- immediately executing
+    `procedure.steps[0]` and folding its result into the response as an
+    additional sequential chat message (see `_execute_first_step`).
     """
     procedure = context.procedure
     missing = _missing_required(procedure, collected)
     logger.info("Procedure run=%s missing_inputs=%s", context.run_id, [item.name for item in missing])
 
     if missing:
-        status_value = "COLLECTING_INPUTS"
+        logger.info("Procedure run=%s status=COLLECTING_INPUTS", context.run_id)
         message = (_extraction_failed_message(failed_targets) if extraction_failed
                    else _ask_for_missing_message(missing))
-    else:
-        status_value = "READY"
-        message = _ready_message(procedure, collected)
+        new_context = context.model_copy(update={"inputs": collected, "status": "COLLECTING_INPUTS"})
+        return ProcedureStatus(
+            state="collecting_inputs", message=message, title=context.kb_title, context=new_context,
+        )
 
-    logger.info("Procedure run=%s status=%s", context.run_id, status_value)
-    new_context = context.model_copy(update={"inputs": collected, "status": status_value})
+    logger.info("Procedure run=%s status=READY", context.run_id)
+    ready_message = _ready_message(procedure, collected)
+    ready_context = context.model_copy(update={"inputs": collected, "status": "READY"})
+
+    progress_stage, step_message, final_context = await _execute_first_step(ready_context, config)
+    logger.info("Procedure run=%s status=%s", context.run_id, final_context.status)
+
     return ProcedureStatus(
-        state=status_value.lower(), message=message, title=context.kb_title, context=new_context,
+        state=final_context.status.lower(), message=step_message, title=context.kb_title,
+        messages=(ready_message, step_message), progress_stages=(progress_stage,),
+        context=final_context,
     )
 
 
@@ -286,7 +345,7 @@ async def handle_procedure(message: str, config: Config) -> ProcedureStatus:
     deterministically (no LLM, no second MCP call) -> apply declared
     defaults -> extract any remaining input values from the original
     request text -> ask for whatever required input is still missing, or
-    report READY. Does not execute any step yet.
+    -- once READY -- execute `procedure.steps[0]` and report its result.
     """
     query = extract_procedure_query(message)
     if not query:
@@ -328,12 +387,18 @@ async def handle_procedure(message: str, config: Config) -> ProcedureStatus:
         run_id=run_id, original_request=query, kb_title=request.kb.title, kb_content=request.kb.content,
         procedure=procedure, inputs=collected, status="COLLECTING_INPUTS",
     )
-    outcome_status = _settle(context, collected, extraction_failed, remaining)
+    outcome_status = await _settle(context, collected, extraction_failed, remaining, config)
+
+    # `_settle` may itself produce more than one sequential message/stage
+    # once READY (the "ready" message followed by the step-1 result); fold
+    # those onto this request's own KB-found/parsed sequence.
+    tail_messages = outcome_status.messages or (outcome_status.message,)
+    tail_stages = outcome_status.progress_stages or ()
 
     return ProcedureStatus(
         state=outcome_status.state, message=outcome_status.message, title=request.kb.title,
-        messages=(kb_found_message, parsed_summary, outcome_status.message),
-        progress_stages=("Parsing procedure", "Extracting inputs"),
+        messages=(kb_found_message, parsed_summary, *tail_messages),
+        progress_stages=("Parsing procedure", "Extracting inputs", *tail_stages),
         context=outcome_status.context,
     )
 
@@ -354,16 +419,16 @@ async def handle_procedure_input_reply(message: str, context: ProcedureContext, 
     if len(missing) == 1:
         reply = message.strip()
         if not reply:
-            return _settle(context, context.inputs, extraction_failed=False, failed_targets=missing)
+            return await _settle(context, context.inputs, extraction_failed=False, failed_targets=missing, config=config)
         item = missing[0]
         collected = {**context.inputs, item.name: coerce_primitive(reply)}
         logger.info("Procedure run=%s inputs_extracted=%s", context.run_id, [item.name])
-        return _settle(context, collected, extraction_failed=False, failed_targets=missing)
+        return await _settle(context, collected, extraction_failed=False, failed_targets=missing, config=config)
 
     collected, extraction_failed = await _extract_and_merge(
         context.run_id, message, missing, context.inputs, config,
     )
-    return _settle(context, collected, extraction_failed, missing)
+    return await _settle(context, collected, extraction_failed, missing, config)
 
 
 def handle_cancel(context: ProcedureContext) -> ProcedureStatus:

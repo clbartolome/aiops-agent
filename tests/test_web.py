@@ -348,6 +348,60 @@ def test_cancel_clears_the_active_procedure(agent, procedure_lifecycle, config):
     procedure_lifecycle.reply.assert_not_awaited()
 
 
+@pytest.mark.parametrize("terminal_status", ["FIRST_STEP_COMPLETED", "STOPPED", "FAILED"])
+def test_after_step_execution_normal_chat_is_not_consumed(agent, procedure_lifecycle, config, terminal_status):
+    """After the first step's outcome (success, stop, or failure), the
+    procedure is no longer actively waiting on input; the next plain
+    message must reach the existing OperationsAgent unchanged.
+    """
+    from app.procedure.models import ProcedureStatus
+
+    session_id = create_test_session()
+    terminal_context = make_procedure_context(status=terminal_status, inputs={"namespace": "payments"})
+    procedure_lifecycle.start.return_value = ProcedureStatus(
+        state=terminal_status.lower(), message="Step completed: Step 1\n\nDone.", context=terminal_context,
+    )
+    request("POST", f"/api/sessions/{session_id}/messages",
+            json={"message": "/procedure inspect namespace health for namespace payments"})
+
+    response = request("POST", f"/api/sessions/{session_id}/messages", json={"message": "hello"})
+    assert response.status_code == 200
+    assert response.json() == {"response": agent.return_value}
+    assert agent.await_args.args[:2] == ("hello", config)
+    procedure_lifecycle.reply.assert_not_awaited()
+
+
+def test_step_execution_payload_includes_the_full_message_sequence(agent, monkeypatch, config):
+    """The step-1 outcome rides the same `messages`/`progress_stages`
+    contract already used for KB-found/parsed/collected-inputs sequencing;
+    no new transport or payload shape is introduced for step execution.
+    """
+    from app.procedure.models import ProcedureStatus
+
+    status = ProcedureStatus(
+        state="first_step_completed",
+        message="Step completed: Verify that the namespace exists\n\nNamespace payments exists.",
+        messages=(
+            "KB found: Inspect namespace health",
+            "Procedure parsed successfully.",
+            "Inputs collected:\n\n- Namespace: payments\n\nProcedure is ready to execute.",
+            "Step completed: Verify that the namespace exists\n\nNamespace payments exists.",
+        ),
+        progress_stages=("Parsing procedure", "Extracting inputs", "Running: Verify that the namespace exists..."),
+    )
+    monkeypatch.setattr(web, "handle_procedure", AsyncMock(return_value=status))
+
+    response = request("POST", "/api/chat", json={"message": "/procedure inspect namespace health for payments"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["state"] == "first_step_completed"
+    assert len(payload["messages"]) == 4
+    assert payload["progress_stages"][-1] == "Running: Verify that the namespace exists..."
+    # Step 2's title never appears anywhere in the payload (it is never run).
+    assert "List pods" not in str(payload)
+    agent.assert_not_awaited()
+
+
 def test_procedure_context_never_appears_in_the_response(agent, procedure_lifecycle, config):
     from app.procedure.models import ProcedureStatus
 
