@@ -18,6 +18,7 @@ from app.procedure import (
     is_executable_procedure,
     is_procedure_command,
 )
+from tests.conftest import drain_procedure_events, event_types, message_texts, progress_texts
 
 EXECUTABLE_KB = (
     "# Inspect namespace health\n\n"
@@ -97,6 +98,11 @@ def itsm_mcp(monkeypatch):
     return SimpleNamespace(calls=calls, call_tool=call_tool)
 
 
+def run_procedure(message, config):
+    """Drive `handle_procedure` to completion and return (events, status)."""
+    return asyncio.run(drain_procedure_events(handle_procedure(message, config)))
+
+
 # --- Routing (pure string checks, no LLM) -----------------------------------
 
 @pytest.mark.parametrize("message, expected", [
@@ -134,9 +140,12 @@ def test_is_executable_procedure(content, expected):
 
 @pytest.mark.parametrize("message", ["/procedure", "/procedure    "])
 def test_empty_command_does_not_call_mcp(message, config, itsm_mcp):
-    status = asyncio.run(handle_procedure(message, config))
+    events, status = run_procedure(message, config)
     assert status.state == "empty_query"
     assert status.message == EMPTY_QUERY_MESSAGE
+    assert message_texts(events) == [EMPTY_QUERY_MESSAGE]
+    # No progress bubble at all: there is nothing to do yet.
+    assert progress_texts(events) == []
     itsm_mcp.call_tool.assert_not_awaited()
 
 
@@ -146,7 +155,7 @@ def test_calls_exactly_rag_search_kb(config, itsm_mcp):
     itsm_mcp.call_tool.return_value = kb_result(
         {"id": 1, "title": "Inspect namespace health", "description": EXECUTABLE_KB, "score": 0.9}
     )
-    asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    run_procedure("/procedure inspect namespace health", config)
     assert len(itsm_mcp.calls) == 1
     tool_name, _arguments = itsm_mcp.calls[0]
     assert tool_name == RAG_SEARCH_TOOL
@@ -156,9 +165,22 @@ def test_search_query_extracted_from_command(config, itsm_mcp):
     itsm_mcp.call_tool.return_value = kb_result(
         {"id": 1, "title": "Inspect namespace health", "description": EXECUTABLE_KB, "score": 0.9}
     )
-    asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    run_procedure("/procedure inspect namespace health", config)
     _tool_name, arguments = itsm_mcp.calls[0]
     assert arguments["query"] == "inspect namespace health"
+
+
+def test_searching_kb_progress_shown_and_cleared_around_the_mcp_call(config, itsm_mcp):
+    """The "Searching KB" progress bubble must be live: shown right before
+    `rag_search_kb`, cleared right after -- never left stuck for the rest
+    of the turn.
+    """
+    itsm_mcp.call_tool.return_value = kb_result(
+        {"id": 1, "title": "Inspect namespace health", "description": EXECUTABLE_KB, "score": 0.9}
+    )
+    events, _status = run_procedure("/procedure inspect namespace health", config)
+    assert event_types(events)[:2] == ["procedure_progress", "procedure_progress_clear"]
+    assert events[0]["message"] == "Searching KB"
 
 
 # --- Successful KB retrieval + deterministic parsing --------------------------
@@ -176,36 +198,37 @@ def no_extraction(monkeypatch):
 
 def test_successful_kb_retrieval_and_parse(config, itsm_mcp, no_extraction):
     """End-to-end: /procedure request -> rag_search_kb (once) -> KB found ->
-    parse that exact KB -> ProcedureDefinition -> three sequential chat
-    messages, ending by asking for the one input nothing could fill in.
+    parse that exact KB -> ProcedureDefinition -> live progress/message
+    events, ending by asking for the one input nothing could fill in.
+
+    The parsed-procedure message is deliberately compact: the full
+    required/optional input list and step list are internal/log detail,
+    not permanent chat noise (see `app.procedure._parsed_summary_message`).
     """
     itsm_mcp.call_tool.return_value = kb_result(
         {"id": 1, "title": "Inspect namespace health", "description": VALID_PROCEDURE_KB, "score": 0.9},
         {"id": 2, "title": "Other article", "description": VALID_PROCEDURE_KB, "score": 0.1},
     )
-    status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    events, status = run_procedure("/procedure inspect namespace health", config)
 
     # rag_search_kb was called exactly once; parsing never re-queries the KB.
     assert len(itsm_mcp.calls) == 1
 
     assert status.state == "collecting_inputs"
     assert status.title == "Inspect namespace health"
-    assert status.messages == (
-        "KB found: Inspect namespace health",
-        "Procedure parsed successfully.\n"
-        "\n"
-        "Required inputs:\n"
-        "- Namespace\n"
-        "\n"
-        "Steps:\n"
-        "1. Verify that the namespace exists\n"
-        "2. List pods in the namespace\n"
-        "3. Review recent events\n"
-        "4. Inspect deployments",
-        "What namespace should I use?",
-    )
     assert status.message == "What namespace should I use?"
-    assert status.progress_stages == ("Parsing procedure", "Extracting inputs")
+    assert message_texts(events) == [
+        "KB found: Inspect namespace health",
+        "Procedure loaded: 4 steps.",
+        "What namespace should I use?",
+    ]
+    assert progress_texts(events) == ["Searching KB", "Parsing procedure", "Extracting parameters"]
+    # Every progress event is immediately cleared before the next thing happens.
+    assert event_types(events) == [
+        "procedure_progress", "procedure_progress_clear", "procedure_message",
+        "procedure_progress", "procedure_progress_clear", "procedure_message",
+        "procedure_progress", "procedure_progress_clear", "procedure_message",
+    ]
     assert status.context is not None
     assert status.context.status == "COLLECTING_INPUTS"
     assert status.context.inputs == {}
@@ -225,22 +248,23 @@ def test_parse_error_kb_stops_without_falling_back_to_agent(config, itsm_mcp):
     itsm_mcp.call_tool.return_value = kb_result(
         {"id": 1, "title": "Inspect namespace health", "description": broken_kb, "score": 0.9}
     )
-    status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    events, status = run_procedure("/procedure inspect namespace health", config)
     assert status.state == "parse_error"
-    assert status.messages == (
+    assert message_texts(events) == [
         "KB found: Inspect namespace health",
         "Unable to parse the procedure.\n\nMissing required metadata: Version.",
-    )
-    assert status.message == status.messages[1]
+    ]
+    assert status.message == message_texts(events)[1]
 
 
 # --- KB not found -------------------------------------------------------------
 
 def test_no_matching_kb(config, itsm_mcp):
     itsm_mcp.call_tool.return_value = kb_result()
-    status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    events, status = run_procedure("/procedure inspect namespace health", config)
     assert status.state == "no_result"
     assert status.message == NO_RESULT_MESSAGE
+    assert message_texts(events) == [NO_RESULT_MESSAGE]
 
 
 # --- Non-executable KB --------------------------------------------------------
@@ -249,24 +273,28 @@ def test_non_executable_kb_stops_the_procedure_path(config, itsm_mcp):
     itsm_mcp.call_tool.return_value = kb_result(
         {"id": 1, "title": "Inspect namespace health", "description": NON_EXECUTABLE_KB, "score": 0.9}
     )
-    status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    events, status = run_procedure("/procedure inspect namespace health", config)
     assert status.state == "not_executable"
     assert status.message == NOT_EXECUTABLE_MESSAGE
+    assert message_texts(events) == ["KB found: Inspect namespace health"]
 
 
 # --- MCP failure ---------------------------------------------------------------
 
 def test_mcp_failure_returns_controlled_error_state(config, itsm_mcp):
     itsm_mcp.call_tool.side_effect = RuntimeError("boom")
-    status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    events, status = run_procedure("/procedure inspect namespace health", config)
     assert status.state == "mcp_error"
     assert status.message == MCP_FAILURE_MESSAGE
+    assert message_texts(events) == [MCP_FAILURE_MESSAGE]
+    # The "Searching KB" bubble is cleared even though the call itself failed.
+    assert event_types(events) == ["procedure_progress", "procedure_progress_clear", "procedure_message"]
 
 
 def test_mcp_error_result_returns_controlled_error_state(config, itsm_mcp):
     itsm_mcp.call_tool.return_value = CallToolResult(
         content=[TextContent(type="text", text="boom")], is_error=True,
     )
-    status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    events, status = run_procedure("/procedure inspect namespace health", config)
     assert status.state == "mcp_error"
     assert status.message == MCP_FAILURE_MESSAGE

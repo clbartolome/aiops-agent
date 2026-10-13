@@ -21,6 +21,7 @@ from mcp.types import CallToolResult, TextContent
 import app.procedure as procedure_module
 from app.procedure import handle_cancel, handle_procedure, handle_procedure_input_reply
 from app.procedure.models import ProcedureContext, StepResult
+from tests.conftest import drain_procedure_events, message_texts
 
 # A single required input, no default.
 KB_SINGLE_INPUT = """# Inspect namespace health
@@ -146,12 +147,14 @@ def extractor(monkeypatch):
 
 
 @pytest.fixture
-def step_executor(monkeypatch):
+def step_executor(monkeypatch, summarizer):
     """Mock the Step Executor; tests set `.return_value`/`.side_effect`.
 
     Defaults to a successful step so tests that reach READY (and therefore
-    trigger step-1 execution) do not need to care about it unless they are
-    specifically testing step execution. Never calls a real model/MCP tool.
+    trigger step execution, and then final-summary generation -- see the
+    `summarizer` fixture dependency) do not need to care about either
+    unless they are specifically testing step execution. Never calls a
+    real model/MCP tool.
     """
     mock = AsyncMock(return_value=StepResult(status="SUCCESS", summary="Step completed."))
     monkeypatch.setattr(procedure_module, "execute_step", mock)
@@ -177,24 +180,33 @@ def make_context(kb_content: str, inputs: dict | None = None, status: str = "COL
     )
 
 
+def run_procedure(message, config):
+    return asyncio.run(drain_procedure_events(handle_procedure(message, config)))
+
+
+def run_reply(message, context, config):
+    return asyncio.run(drain_procedure_events(handle_procedure_input_reply(message, context, config)))
+
+
 # --- Value already present in the original /procedure request --------------
 
 def test_value_already_in_request_asks_nothing(config, itsm_mcp, extractor, step_executor):
     start_procedure(config, itsm_mcp, KB_SINGLE_INPUT)
     extractor.return_value = {"namespace": "payments"}
 
-    status = asyncio.run(handle_procedure(
+    events, status = run_procedure(
         "/procedure inspect namespace health for namespace payments", config,
-    ))
+    )
 
     # Once READY, the (single) step is executed automatically within the
-    # same call (see the step-execution tests below); the "ready" message
-    # is still shown as an intermediate sequential message.
+    # same call (see the step-execution tests below); the compact "ready"
+    # message is still shown as an intermediate sequential message.
     assert status.state == "completed"
     assert status.context.inputs == {"namespace": "payments"}
     assert "What namespace" not in status.message
-    assert "Inputs collected:\n\n- Namespace: payments\n\nProcedure is ready to execute." in status.messages
-    assert "Step completed: Verify that the namespace exists\n\nStep completed." in status.messages
+    messages = message_texts(events)
+    assert "Using Namespace: payments." in messages
+    assert "Step completed." in messages
     assert status.message == "Procedure completed successfully."
 
 
@@ -204,7 +216,7 @@ def test_missing_input_is_asked(config, itsm_mcp, extractor):
     start_procedure(config, itsm_mcp, KB_SINGLE_INPUT)
     extractor.return_value = {}
 
-    status = asyncio.run(handle_procedure("/procedure inspect namespace health", config))
+    _events, status = run_procedure("/procedure inspect namespace health", config)
 
     assert status.state == "collecting_inputs"
     assert status.message == "What namespace should I use?"
@@ -217,7 +229,7 @@ def test_missing_input_is_asked(config, itsm_mcp, extractor):
 def test_single_value_reply_uses_no_llm_shortcut(config, extractor, step_executor):
     context = make_context(KB_SINGLE_INPUT, inputs={}, status="COLLECTING_INPUTS")
 
-    status = asyncio.run(handle_procedure_input_reply("payments", context, config))
+    _events, status = run_reply("payments", context, config)
 
     extractor.assert_not_awaited()
     assert status.state == "completed"
@@ -232,9 +244,9 @@ def test_multiple_values_in_original_request(config, itsm_mcp, extractor, step_e
     start_procedure(config, itsm_mcp, KB_TWO_INPUTS)
     extractor.return_value = {"namespace": "payments", "application_name": "checkout"}
 
-    status = asyncio.run(handle_procedure(
+    _events, status = run_procedure(
         "/procedure inspect checkout in namespace payments", config,
-    ))
+    )
 
     assert status.state == "completed"
     assert status.context.inputs == {"namespace": "payments", "application_name": "checkout"}
@@ -246,9 +258,9 @@ def test_partial_original_request_asks_only_remaining(config, itsm_mcp, extracto
     start_procedure(config, itsm_mcp, KB_TWO_INPUTS)
     extractor.return_value = {"namespace": "payments"}  # application_name not found
 
-    status = asyncio.run(handle_procedure(
+    _events, status = run_procedure(
         "/procedure inspect checkout in namespace payments", config,
-    ))
+    )
 
     assert status.state == "collecting_inputs"
     assert status.context.inputs == {"namespace": "payments"}
@@ -262,9 +274,9 @@ def test_multi_field_reply_extracts_both_and_becomes_ready(config, extractor, st
     context = make_context(KB_TWO_INPUTS, inputs={}, status="COLLECTING_INPUTS")
     extractor.return_value = {"namespace": "payments", "application_name": "checkout"}
 
-    status = asyncio.run(handle_procedure_input_reply(
+    _events, status = run_reply(
         "namespace is payments and the app is checkout", context, config,
-    ))
+    )
 
     extractor.assert_awaited_once()
     called_args = extractor.await_args.args
@@ -281,7 +293,7 @@ def test_partial_reply_asks_only_remaining_field(config, extractor):
     context = make_context(KB_TWO_INPUTS, inputs={}, status="COLLECTING_INPUTS")
     extractor.return_value = {"namespace": "payments"}
 
-    status = asyncio.run(handle_procedure_input_reply("namespace is payments", context, config))
+    _events, status = run_reply("namespace is payments", context, config)
 
     assert status.state == "collecting_inputs"
     assert status.context.inputs == {"namespace": "payments"}
@@ -296,7 +308,7 @@ def test_extractor_cannot_invent_missing_input(config, extractor):
     context = make_context(KB_TWO_INPUTS, inputs={}, status="COLLECTING_INPUTS")
     extractor.return_value = {"namespace": "payments"}  # application_name not provided by the user
 
-    status = asyncio.run(handle_procedure_input_reply("the namespace is payments", context, config))
+    _events, status = run_reply("the namespace is payments", context, config)
 
     assert status.context.inputs == {"namespace": "payments"}
     assert "application_name" not in status.context.inputs
@@ -311,7 +323,7 @@ def test_unknown_extractor_field_is_rejected(config, extractor):
     context = make_context(KB_TWO_INPUTS, inputs={}, status="COLLECTING_INPUTS")
     extractor.return_value = {"cluster": "prod"}  # "cluster" is not declared
 
-    status = asyncio.run(handle_procedure_input_reply("the cluster is prod", context, config))
+    _events, status = run_reply("the cluster is prod", context, config)
 
     assert status.context.inputs == {}
     assert "cluster" not in status.context.inputs
@@ -324,22 +336,23 @@ def test_declared_defaults_are_applied_before_extraction(config, itsm_mcp, extra
     start_procedure(config, itsm_mcp, KB_WITH_DEFAULT)
     extractor.return_value = {"namespace": "payments"}
 
-    status = asyncio.run(handle_procedure("/procedure validate app in namespace payments", config))
+    events, status = run_procedure("/procedure validate app in namespace payments", config)
 
     # The default was applied deterministically before extraction ran at all.
     assert status.context.inputs["minimum_pod_count"] == 1
     assert status.state == "completed"
     # No question was ever asked about it; it is only shown for visibility,
     # in the intermediate "ready" message (step 1 now runs automatically).
-    assert not any("should I use" in message for message in status.messages)
-    assert any("Minimum pod count: 1" in message for message in status.messages)
+    messages = message_texts(events)
+    assert not any("should I use" in message for message in messages)
+    assert any("Minimum pod count: 1" in message for message in messages)
 
 
 def test_optional_input_with_default_is_never_asked(config, itsm_mcp, extractor):
     start_procedure(config, itsm_mcp, KB_WITH_DEFAULT)
     extractor.return_value = {}  # namespace missing; minimum_pod_count already defaulted
 
-    status = asyncio.run(handle_procedure("/procedure validate app", config))
+    _events, status = run_procedure("/procedure validate app", config)
 
     assert status.state == "collecting_inputs"
     assert status.message == "What namespace should I use?"
@@ -353,7 +366,7 @@ def test_reply_updates_same_context_not_a_new_one(config, extractor, step_execut
                             run_id="existing-run")
     extractor.return_value = {}
 
-    status = asyncio.run(handle_procedure_input_reply("checkout", context, config))
+    _events, status = run_reply("checkout", context, config)
 
     assert status.context.run_id == "existing-run"
     assert status.context.inputs["namespace"] == "payments"
@@ -369,9 +382,9 @@ def test_extraction_failure_during_initial_request_asks_directly(config, itsm_mc
     start_procedure(config, itsm_mcp, KB_SINGLE_INPUT)
     extractor.side_effect = RuntimeError("provider failure Authorization: Bearer test-openshift-token")
 
-    status = asyncio.run(handle_procedure(
+    _events, status = run_procedure(
         "/procedure inspect namespace health mentioning something", config,
-    ))
+    )
 
     assert status.state == "collecting_inputs"
     assert status.message == "I couldn't extract the namespace from that message.\n\nWhat namespace should I use?"
@@ -383,7 +396,7 @@ def test_extraction_failure_during_reply_preserves_context(config, extractor, ca
     context = make_context(KB_TWO_INPUTS, inputs={}, status="COLLECTING_INPUTS")
     extractor.side_effect = RuntimeError("boom")
 
-    status = asyncio.run(handle_procedure_input_reply("something ambiguous", context, config))
+    _events, status = run_reply("something ambiguous", context, config)
 
     assert status.state == "collecting_inputs"
     assert status.context.inputs == {}
@@ -397,7 +410,7 @@ def test_invalid_extracted_field_type_does_not_crash(config, extractor):
     context = make_context(KB_TWO_INPUTS, inputs={}, status="COLLECTING_INPUTS")
     extractor.return_value = {"namespace": "payments", "unexpected_field": "value"}
 
-    status = asyncio.run(handle_procedure_input_reply("payments namespace, something else too", context, config))
+    _events, status = run_reply("payments namespace, something else too", context, config)
 
     assert status.context.inputs == {"namespace": "payments"}
     assert "unexpected_field" not in status.context.inputs
@@ -426,7 +439,7 @@ def test_no_openshift_or_aap_tool_is_ever_called(config, itsm_mcp, extractor, st
     start_procedure(config, itsm_mcp, KB_TWO_INPUTS)
     extractor.return_value = {"namespace": "payments", "application_name": "checkout"}
 
-    status = asyncio.run(handle_procedure("/procedure inspect checkout in namespace payments", config))
+    _events, status = run_procedure("/procedure inspect checkout in namespace payments", config)
     assert status.state == "completed"
 
     # The only MCP tool call observed anywhere in input collection is the fixed KB search.

@@ -37,21 +37,20 @@ class ProcedureRequest:
 
 @dataclass(frozen=True)
 class ProcedureStatus:
-    """A single, UI-facing snapshot of `/procedure` processing.
+    """The terminal, UI-facing outcome of one `/procedure` turn.
 
     `state` is a small machine-readable tag (for example "kb_found",
-    "collecting_inputs", "first_step_completed", "stopped", "failed",
-    "cancelled", "parse_error", "no_result", "not_executable",
-    "empty_query", "mcp_error"). `message` is the human-readable text the
-    chat UI renders as a normal chat message once procedure processing
-    finishes; it is always the *last* entry of `messages` when more than
-    one is produced (for example "KB found: ..." then the parsed summary,
-    then the collected-inputs/ready outcome, then the first step's
-    completed/stopped/failed result).
+    "collecting_inputs", "completed", "stopped", "failed", "cancelled",
+    "parse_error", "no_result", "not_executable", "empty_query",
+    "mcp_error"). `message` is the final human-readable text for this
+    turn (whatever is still useful to a non-streaming caller, e.g.
+    `/api/chat`); the chat UI itself renders every permanent message as
+    its own `procedure_message` event while the procedure runs (see
+    `app.procedure`'s module docstring) rather than from this field.
 
-    `progress_stages`, when present, has exactly `len(messages) - 1`
-    entries: the transient progress-bubble label to show right before
-    revealing `messages[i]` for `i > 0`.
+    This is always the *last* item an `app.procedure` event generator
+    yields (every earlier yielded item is a wire-shaped progress/message
+    event dict); see `app.web._stream_procedure`.
 
     `context` carries the active `ProcedureContext` to persist on the chat
     session for the next turn (or `None` once there is no procedure left
@@ -62,8 +61,6 @@ class ProcedureStatus:
     state: str
     message: str
     title: str | None = None
-    messages: tuple[str, ...] | None = None
-    progress_stages: tuple[str, ...] | None = None
     context: "ProcedureContext | None" = None
 
 

@@ -6,7 +6,58 @@ import pytest
 from agents.mcp import MCPServerStreamableHttp
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
+import app.procedure as procedure_module
 from app.config import Config, MCPConfig
+from app.procedure.models import ProcedureStatus
+
+# The default canned summary matches the old, deterministic
+# "Procedure completed successfully." terminal message exactly, so tests
+# that only care about the happy path need no changes to their final
+# `message`/`messages[-1]` assertions; tests that specifically exercise
+# summary generation override `.return_value`/`.side_effect` directly.
+DEFAULT_SUMMARY = "Procedure completed successfully."
+
+
+async def drain_procedure_events(generator) -> tuple[list[dict], ProcedureStatus]:
+    """Run one of `app.procedure`'s event-generator functions
+    (`handle_procedure`/`handle_procedure_input_reply`, or any of their
+    internal helpers) to completion, splitting its output into
+    `(events, final_status)`:
+
+    - `events` is every wire-shaped progress/clear/message dict it
+      yielded, in the exact order they were produced.
+    - `final_status` is the terminal `ProcedureStatus` it ends with
+      (always the last item yielded; never `None` for these generators).
+
+    This is test-only plumbing mirroring `app.web._stream_procedure` (the
+    real client just forwards `events` to the wire as it drains the same
+    generator; it never collects them into a list first).
+    """
+    events = []
+    final_status = None
+    async for item in generator:
+        if isinstance(item, ProcedureStatus):
+            final_status = item
+        else:
+            events.append(item)
+    return events, final_status
+
+
+def progress_texts(events: list[dict]) -> list[str]:
+    """Every `procedure_progress` label, in order, dropping clear/message events."""
+    return [event["message"] for event in events if event["type"] == "procedure_progress"]
+
+
+def message_texts(events: list[dict]) -> list[str]:
+    """Every permanent `procedure_message` text, in order."""
+    return [event["message"] for event in events if event["type"] == "procedure_message"]
+
+
+def event_types(events: list[dict]) -> list[str]:
+    """Just the `type` of each event, in order -- for asserting exact
+    interleaving (e.g. progress -> clear -> message -> progress -> ...).
+    """
+    return [event["type"] for event in events]
 
 
 @pytest.fixture
@@ -16,6 +67,17 @@ def config():
         MCPConfig("aap", "https://aap.test/mcp"),
         MCPConfig("itsm", "https://itsm.test/mcp"),
     ))
+
+
+@pytest.fixture
+def summarizer(monkeypatch):
+    """Mock the final-summary LLM call (`app.procedure.summarizer`); never
+    makes a real model call. Tests set `.return_value`/`.side_effect`
+    (e.g. return `None` to exercise the deterministic fallback).
+    """
+    mock = AsyncMock(return_value=DEFAULT_SUMMARY)
+    monkeypatch.setattr(procedure_module, "generate_procedure_summary", mock)
+    return mock
 
 
 @pytest.fixture

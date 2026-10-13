@@ -104,9 +104,6 @@
     // "/procedure" prefix (followed by whitespace or the end of input) activates
     // procedure mode. No natural-language inference happens here either.
     const PROCEDURE_PATTERN = /^\/procedure(\s(.*))?$/s;
-    // Cosmetic-only delay between sequential procedure stages (e.g. KB found
-    // -> parsing) revealed from a single response; no second request is made.
-    const PROCEDURE_STAGE_DELAY_MS = 500;
     let procedureMode = false;
     // True right after a response asks for more procedure input (state
     // "collecting_inputs"). The *next* plain message belongs to that
@@ -173,17 +170,23 @@
     async function selectSession(id) {
       if (busy) return;
       setBusy(true);
+      // The active session and its rendered history are switched together,
+      // immediately -- never left showing the *previous* session's messages
+      // under the *new* session's identity while its own history loads.
+      selectedSession = id;
+      procedureAwaitingInput = false;
+      history.replaceChildren();
+      input.value = '';
+      status.textContent = 'Loading conversation...';
       try {
         const session = await api(`/api/sessions/${id}`);
-        selectedSession = id;
-        procedureAwaitingInput = false;
-        history.replaceChildren();
-        input.value = '';
-        for (const message of session.messages) appendMessage(message.content, message.role);
+        for (const message of session.messages) renderStoredMessage(message);
         await refreshSessions();
         status.textContent = '';
       } catch (error) {
-        status.textContent = `Error: ${error.message}`;
+        // Loading failed: show nothing rather than stale/foreign messages.
+        history.replaceChildren();
+        status.textContent = 'Unable to load this conversation.';
       } finally {
         setBusy(false);
         input.focus();
@@ -259,6 +262,23 @@
       form.scrollIntoView({ block: 'end' });
     }
 
+    // Reconstruct a persisted session message exactly as it was originally
+    // rendered live, with no extra wire-format metadata needed: a stored
+    // user message that still matches the same `/procedure ...` pattern the
+    // live submit handler checks restores as the styled "PROCEDURE" line;
+    // everything else (including procedure KB/step/summary output, which
+    // is persisted as plain assistant messages) is just a normal message.
+    function renderStoredMessage(message) {
+      if (message.role === 'user') {
+        const match = message.content.match(PROCEDURE_PATTERN);
+        if (match) {
+          appendProcedureMessage((match[2] || '').trim());
+          return;
+        }
+      }
+      appendMessage(message.content, message.role);
+    }
+
     // Reusable transient progress indicator. Procedure stages call show()/
     // update()/hide() with a short label (e.g. "Searching KB", later
     // "Parsing procedure", "Running step 1", ...). Only one instance is ever
@@ -311,6 +331,47 @@
       return { show, update, hide };
     })();
 
+    // One line of the backend's live procedure event stream (see
+    // app.web._stream_procedure / app.procedure's module docstring):
+    // each line is handled the instant it arrives, not batched up and
+    // read only once the whole response finishes.
+    function handleProcedureEvent(data) {
+      if (data.type === 'procedure_progress') {
+        procedureProgress.show(data.message);
+      } else if (data.type === 'procedure_progress_clear') {
+        procedureProgress.hide();
+      } else if (data.type === 'procedure_message') {
+        // A permanent message always ends any transient bubble still
+        // showing, even if its matching clear event was somehow skipped.
+        procedureProgress.hide();
+        appendMessage(data.message, 'assistant');
+      } else if (data.type === 'procedure_status') {
+        procedureProgress.hide();
+        procedureAwaitingInput = data.state === 'collecting_inputs';
+      }
+    }
+
+    // Read the streaming NDJSON response body incrementally, dispatching
+    // each complete line as soon as it is available -- this is what makes
+    // progress genuinely live instead of a single batched response.
+    async function readProcedureStream(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (value) buffer += decoder.decode(value, { stream: true });
+        let newlineIndex;
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          if (line.trim()) handleProcedureEvent(JSON.parse(line));
+        }
+        if (done) break;
+      }
+      if (buffer.trim()) handleProcedureEvent(JSON.parse(buffer));
+    }
+
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const rawInput = input.value;
@@ -333,7 +394,7 @@
 
       // An empty "/procedure" needs no MCP call, so no loading state is shown.
       if (isProcedure && procedureQuery) procedureProgress.show('Searching KB');
-      else if (isProcedureReply) procedureProgress.show('Extracting inputs');
+      else if (isProcedureReply) procedureProgress.show('Extracting parameters');
 
       try {
         const response = await fetch(`/api/sessions/${sessionId}/messages`, {
@@ -341,29 +402,21 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message }),
         });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
-        }
-        procedureProgress.hide();
-        if (data.type === 'procedure_status') {
-          // A single /procedure request/reply can produce more than one
-          // normal chat message in sequence (e.g. "KB found: ..." then the
-          // parsed summary, then the collected-inputs/ready outcome).
-          // Reveal them one at a time, showing the reusable transient
-          // progress bubble (with its own label per stage) in between.
-          const messages = data.messages && data.messages.length ? data.messages : [data.message];
-          const stages = data.progress_stages || [];
-          for (let index = 0; index < messages.length; index++) {
-            if (index > 0) {
-              procedureProgress.show(stages[index - 1] || 'Parsing procedure');
-              await new Promise((resolve) => setTimeout(resolve, PROCEDURE_STAGE_DELAY_MS));
-              procedureProgress.hide();
-            }
-            appendMessage(messages[index], 'assistant');
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/x-ndjson')) {
+          if (!response.ok) {
+            throw new Error('The request could not be processed.');
           }
-          procedureAwaitingInput = data.state === 'collecting_inputs';
+          // A /procedure command (or a reply while one is waiting on
+          // input) streams progress/message events live as the backend
+          // produces them -- see readProcedureStream.
+          await readProcedureStream(response);
         } else {
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
+          }
+          procedureProgress.hide();
           appendMessage(data.response, 'assistant');
           procedureAwaitingInput = false;
         }
