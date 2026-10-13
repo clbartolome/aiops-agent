@@ -1,12 +1,13 @@
-"""Orchestration of step chaining within the `/procedure` flow.
+"""Orchestration of the generic sequential step loop within the `/procedure`
+flow.
 
 Mirrors the flow:
 
-    READY -> execute procedure.steps[0]
-    -> if SUCCESS, execute procedure.steps[1] with step 1's result as
-       compact previous-step context
-    -> store both results -> show each in chat -> stop
-       (no step beyond steps[1] is executed yet)
+    READY -> RUNNING -> execute procedure.steps in fixed order, one at a
+    time, each step receiving every earlier successful step's result as
+    compact previous-step context -> continue only while each step returns
+    SUCCESS -> stop immediately on STOP or FAILED, preserving every result
+    already stored -> COMPLETED once every step has succeeded
 
 The Step Executor itself (`app.procedure.execute_step`) is always mocked
 here; its own agentic/MCP-level behavior (including `previous_results`
@@ -26,9 +27,7 @@ import app.procedure as procedure_module
 from app.procedure import handle_procedure, handle_procedure_input_reply
 from app.procedure.models import ProcedureContext, StepResult
 
-# A four-step procedure (mirrors the manual acceptance scenario): only
-# steps 1 and 2 ("Verify that the namespace exists", "List pods in the
-# namespace") must ever be invoked this iteration.
+# A four-step procedure (mirrors the manual acceptance scenario).
 KB_FOUR_STEPS = """# Inspect namespace health
 
 Inspect the current state of an OpenShift namespace.
@@ -71,10 +70,17 @@ STEP_1_TITLE = "Verify that the namespace exists"
 STEP_1_ID = "verify_that_the_namespace_exists"
 STEP_2_TITLE = "List pods in the namespace"
 STEP_2_ID = "list_pods_in_the_namespace"
+STEP_3_TITLE = "Review recent events"
 STEP_3_ID = "review_recent_events"
+STEP_4_TITLE = "Inspect deployments"
+STEP_4_ID = "inspect_deployments"
+ALL_STEP_IDS = [STEP_1_ID, STEP_2_ID, STEP_3_ID, STEP_4_ID]
 
 SUCCESS_1 = StepResult(status="SUCCESS", summary="Namespace payments exists.")
 SUCCESS_2 = StepResult(status="SUCCESS", summary="Found 8 pods in namespace payments.")
+SUCCESS_3 = StepResult(status="SUCCESS", summary="No warning events found.")
+SUCCESS_4 = StepResult(status="SUCCESS", summary="All deployments are healthy.")
+ALL_SUCCESS = [SUCCESS_1, SUCCESS_2, SUCCESS_3, SUCCESS_4]
 
 
 def kb_result(*entries):
@@ -115,7 +121,7 @@ def extractor(monkeypatch):
 def step_executor(monkeypatch):
     """Mock the Step Executor; defaults to SUCCESS for every step unless a
     test overrides `.return_value`/`.side_effect` (e.g. a list of results,
-    one per expected call, to script step 1 then step 2 differently).
+    one per expected call, to script different steps differently).
     """
     mock = AsyncMock(return_value=StepResult(status="SUCCESS", summary="Step completed."))
     monkeypatch.setattr(procedure_module, "execute_step", mock)
@@ -139,56 +145,84 @@ def make_ready_context(run_id="run-1") -> ProcedureContext:
     )
 
 
-# --- Step 1 SUCCESS executes step 2, in order -------------------------------
+def executed_step_ids(step_executor) -> list[str]:
+    return [call.args[1].id for call in step_executor.await_args_list]
 
-def test_step_1_success_executes_step_2_in_order(config, step_executor):
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
+
+# --- All steps succeed -------------------------------------------------------
+
+def test_all_four_steps_succeed_in_order(config, step_executor):
+    step_executor.side_effect = list(ALL_SUCCESS)
     context = make_ready_context()
 
     status = asyncio.run(handle_procedure_input_reply("payments", context, config))
 
-    assert step_executor.await_count == 2
-    first_step = step_executor.await_args_list[0].args[1]
-    second_step = step_executor.await_args_list[1].args[1]
-    assert first_step.id == STEP_1_ID
-    assert second_step.id == STEP_2_ID
-    assert status.state == "second_step_completed"
+    assert step_executor.await_count == 4
+    assert executed_step_ids(step_executor) == ALL_STEP_IDS
+    assert status.state == "completed"
+    assert status.context.status == "COMPLETED"
 
 
-# --- Step 1 result is passed to step 2 as previous_results ------------------
+def test_full_sequence_from_a_fresh_procedure_request(config, itsm_mcp, extractor, step_executor):
+    """The full acceptance-test sequence: KB found -> parsed -> ready ->
+    every step's result -> the final completion message, all within a
+    single `/procedure` request/response.
+    """
+    start_procedure(config, itsm_mcp, KB_FOUR_STEPS)
+    extractor.return_value = {"namespace": "payments"}
+    step_executor.side_effect = list(ALL_SUCCESS)
 
-def test_step_1_result_passed_to_step_2(config, step_executor):
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
+    status = asyncio.run(handle_procedure(
+        "/procedure inspect namespace health for namespace payments", config,
+    ))
+
+    assert status.progress_stages == (
+        "Parsing procedure", "Extracting inputs",
+        f"Running: {STEP_1_TITLE}...", f"Running: {STEP_2_TITLE}...",
+        f"Running: {STEP_3_TITLE}...", f"Running: {STEP_4_TITLE}...", "Finishing up...",
+    )
+    assert len(status.messages) == 8
+    assert status.messages[0] == "KB found: Inspect namespace health"
+    assert status.messages[3] == f"Step completed: {STEP_1_TITLE}\n\nNamespace payments exists."
+    assert status.messages[4] == f"Step completed: {STEP_2_TITLE}\n\nFound 8 pods in namespace payments."
+    assert status.messages[5] == f"Step completed: {STEP_3_TITLE}\n\nNo warning events found."
+    assert status.messages[6] == f"Step completed: {STEP_4_TITLE}\n\nAll deployments are healthy."
+    assert status.messages[7] == "Procedure completed successfully."
+    assert status.message == "Procedure completed successfully."
+    assert status.state == "completed"
+
+
+# --- Previous context grows ---------------------------------------------------
+
+def test_previous_results_grow_with_each_step(config, step_executor):
+    step_executor.side_effect = list(ALL_SUCCESS)
     context = make_ready_context()
 
     asyncio.run(handle_procedure_input_reply("payments", context, config))
 
-    second_call_kwargs = step_executor.await_args_list[1].kwargs
-    previous = second_call_kwargs["previous_results"]
-    assert len(previous) == 1
-    assert previous[0].step.id == STEP_1_ID
-    assert previous[0].result == SUCCESS_1
+    previous_counts = [len(call.kwargs["previous_results"]) for call in step_executor.await_args_list]
+    assert previous_counts == [0, 1, 2, 3]
 
-    # Step 1 itself was given no previous results.
-    first_call_kwargs = step_executor.await_args_list[0].kwargs
-    assert first_call_kwargs["previous_results"] == []
+    # Original execution order is preserved in step 4's previous results.
+    step_4_previous = step_executor.await_args_list[3].kwargs["previous_results"]
+    assert [item.step.id for item in step_4_previous] == [STEP_1_ID, STEP_2_ID, STEP_3_ID]
+    assert [item.result for item in step_4_previous] == [SUCCESS_1, SUCCESS_2, SUCCESS_3]
 
 
-# --- Inputs are still passed alongside the previous result ------------------
-
-def test_inputs_also_passed_to_step_2(config, step_executor):
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
+def test_inputs_are_passed_to_every_step(config, step_executor):
+    step_executor.side_effect = list(ALL_SUCCESS)
     context = make_ready_context()
 
     asyncio.run(handle_procedure_input_reply("payments", context, config))
 
-    _run_id, _step, _declared, collected, _original_request, _config = step_executor.await_args_list[1].args
-    assert collected == {"namespace": "payments"}
+    for call in step_executor.await_args_list:
+        _run_id, _step, _declared, collected, _original_request, _config = call.args
+        assert collected == {"namespace": "payments"}
 
 
-# --- Step 1 STOP: step 2 never called ---------------------------------------
+# --- STOP on step 1 ------------------------------------------------------------
 
-def test_step_1_stop_never_calls_step_2(config, step_executor):
+def test_stop_on_step_1_never_calls_later_steps(config, step_executor):
     step_executor.return_value = StepResult(status="STOP", summary="Namespace payments does not exist.")
     context = make_ready_context()
 
@@ -196,42 +230,32 @@ def test_step_1_stop_never_calls_step_2(config, step_executor):
 
     step_executor.assert_awaited_once()
     assert status.state == "stopped"
-    assert STEP_2_ID not in status.context.step_results
+    assert status.message == f"Step stopped the procedure: {STEP_1_TITLE}\n\nNamespace payments does not exist."
+    assert status.context.status == "STOPPED"
+    assert set(status.context.step_results) == {STEP_1_ID}
 
 
-# --- Step 1 FAILED: step 2 never called --------------------------------------
+# --- STOP in the middle ---------------------------------------------------------
 
-def test_step_1_failed_never_calls_step_2(config, step_executor):
-    step_executor.return_value = StepResult(status="FAILED", summary="Unable to verify the namespace.")
+def test_stop_in_the_middle_preserves_earlier_results(config, step_executor):
+    stop_3 = StepResult(status="STOP", summary="No events endpoint available; stopping.")
+    step_executor.side_effect = [SUCCESS_1, SUCCESS_2, stop_3]
     context = make_ready_context()
 
     status = asyncio.run(handle_procedure_input_reply("payments", context, config))
 
-    step_executor.assert_awaited_once()
-    assert status.state == "failed"
-    assert STEP_2_ID not in status.context.step_results
-
-
-# --- Step 2 STOP --------------------------------------------------------------
-
-def test_step_2_stop_stops_the_procedure(config, step_executor):
-    stop_2 = StepResult(status="STOP", summary="No pods found; stopping.")
-    step_executor.side_effect = [SUCCESS_1, stop_2]
-    context = make_ready_context()
-
-    status = asyncio.run(handle_procedure_input_reply("payments", context, config))
-
-    assert step_executor.await_count == 2
+    assert step_executor.await_count == 3
+    assert executed_step_ids(step_executor) == [STEP_1_ID, STEP_2_ID, STEP_3_ID]
     assert status.state == "stopped"
-    assert status.message == f"Step stopped the procedure: {STEP_2_TITLE}\n\nNo pods found; stopping."
     assert status.context.step_results[STEP_1_ID] == SUCCESS_1
-    assert status.context.step_results[STEP_2_ID] == stop_2
+    assert status.context.step_results[STEP_2_ID] == SUCCESS_2
+    assert status.context.step_results[STEP_3_ID] == stop_3
     assert status.context.status == "STOPPED"
 
 
-# --- Step 2 FAILED -------------------------------------------------------------
+# --- FAILED in the middle --------------------------------------------------------
 
-def test_step_2_failed_stops_the_procedure(config, step_executor):
+def test_failed_in_the_middle_stops_later_steps(config, step_executor):
     failed_2 = StepResult(status="FAILED", summary="Unable to list pods.")
     step_executor.side_effect = [SUCCESS_1, failed_2]
     context = make_ready_context()
@@ -239,105 +263,52 @@ def test_step_2_failed_stops_the_procedure(config, step_executor):
     status = asyncio.run(handle_procedure_input_reply("payments", context, config))
 
     assert step_executor.await_count == 2
+    assert executed_step_ids(step_executor) == [STEP_1_ID, STEP_2_ID]
     assert status.state == "failed"
-    assert status.message == f"Step failed: {STEP_2_TITLE}\n\nUnable to list pods."
-    # Step 1 remains stored as SUCCESS; it is not retried or overwritten.
+    assert status.context.status == "FAILED"
     assert status.context.step_results[STEP_1_ID] == SUCCESS_1
-    assert status.context.step_results[STEP_1_ID].status == "SUCCESS"
     assert status.context.step_results[STEP_2_ID] == failed_2
 
 
-# --- Step 3 is never executed, even across a four-step procedure -----------
+# --- Final step FAILED -----------------------------------------------------------
 
-def test_step_3_is_never_executed_when_both_steps_succeed(config, step_executor):
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
-    context = make_ready_context()
-
-    asyncio.run(handle_procedure_input_reply("payments", context, config))
-
-    assert step_executor.await_count == 2
-    executed_ids = {call.args[1].id for call in step_executor.await_args_list}
-    assert executed_ids == {STEP_1_ID, STEP_2_ID}
-    assert STEP_3_ID not in executed_ids
-
-
-def test_only_step_one_is_executed_when_a_four_step_procedure_starts_fresh(
-    config, itsm_mcp, extractor, step_executor,
-):
-    start_procedure(config, itsm_mcp, KB_FOUR_STEPS)
-    extractor.return_value = {"namespace": "payments"}
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
-
-    status = asyncio.run(handle_procedure(
-        "/procedure inspect namespace health for namespace payments", config,
-    ))
-
-    assert status.state == "second_step_completed"
-    assert step_executor.await_count == 2
-    executed_ids = [call.args[1].id for call in step_executor.await_args_list]
-    assert executed_ids == [STEP_1_ID, STEP_2_ID]
-
-
-# --- Both results preserved in context --------------------------------------
-
-def test_both_step_results_are_preserved_in_context(config, step_executor):
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
+def test_final_step_failed_keeps_all_earlier_results(config, step_executor):
+    failed_4 = StepResult(status="FAILED", summary="Unable to inspect deployments.")
+    step_executor.side_effect = [SUCCESS_1, SUCCESS_2, SUCCESS_3, failed_4]
     context = make_ready_context()
 
     status = asyncio.run(handle_procedure_input_reply("payments", context, config))
 
-    assert status.context.step_results == {STEP_1_ID: SUCCESS_1, STEP_2_ID: SUCCESS_2}
-    assert list(status.context.step_results) == [STEP_1_ID, STEP_2_ID]  # source order preserved
-    assert status.context.current_step_index == 1
+    assert step_executor.await_count == 4
+    assert status.state == "failed"
+    assert status.context.status == "FAILED"
+    assert status.context.step_results == {
+        STEP_1_ID: SUCCESS_1, STEP_2_ID: SUCCESS_2, STEP_3_ID: SUCCESS_3, STEP_4_ID: failed_4,
+    }
+    assert status.message == f"Step failed: {STEP_4_TITLE}\n\nUnable to inspect deployments."
 
 
-# --- Progress stage / sequential messages -----------------------------------
+# --- Executor exception -----------------------------------------------------------
 
-def test_running_step_progress_stages_for_both_steps(config, step_executor):
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
+def test_unexpected_exception_during_step_3_fails_the_procedure(config, step_executor, caplog):
+    step_executor.side_effect = [SUCCESS_1, SUCCESS_2, RuntimeError("Authorization: Bearer test-openshift-token")]
     context = make_ready_context()
 
     status = asyncio.run(handle_procedure_input_reply("payments", context, config))
 
-    assert status.progress_stages == (f"Running: {STEP_1_TITLE}...", f"Running: {STEP_2_TITLE}...")
-    assert status.messages == (
-        "Inputs collected:\n\n- Namespace: payments\n\nProcedure is ready to execute.",
-        f"Step completed: {STEP_1_TITLE}\n\nNamespace payments exists.",
-        f"Step completed: {STEP_2_TITLE}\n\nFound 8 pods in namespace payments.",
-    )
-    # No hint of step 3 anywhere in the response.
-    assert "Review recent events" not in str(status.messages) + str(status.progress_stages)
+    assert step_executor.await_count == 3
+    assert status.state == "failed"
+    assert status.context.status == "FAILED"
+    assert status.context.step_results[STEP_1_ID] == SUCCESS_1
+    assert status.context.step_results[STEP_2_ID] == SUCCESS_2
+    assert status.context.step_results[STEP_3_ID].status == "FAILED"
+    assert "test-openshift-token" not in caplog.text
+    assert "test-openshift-token" not in status.message
 
 
-def test_full_sequence_from_a_fresh_procedure_request(config, itsm_mcp, extractor, step_executor):
-    """The full acceptance-test sequence: KB found -> parsed -> ready ->
-    step-1 result -> step-2 result, all within a single `/procedure`
-    request/response.
-    """
-    start_procedure(config, itsm_mcp, KB_FOUR_STEPS)
-    extractor.return_value = {"namespace": "payments"}
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
+# --- Single-step procedure --------------------------------------------------------
 
-    status = asyncio.run(handle_procedure(
-        "/procedure inspect namespace health for namespace payments", config,
-    ))
-
-    assert status.progress_stages == (
-        "Parsing procedure", "Extracting inputs", f"Running: {STEP_1_TITLE}...", f"Running: {STEP_2_TITLE}...",
-    )
-    assert len(status.messages) == 5
-    assert status.messages[0] == "KB found: Inspect namespace health"
-    assert status.messages[2] == (
-        "Inputs collected:\n\n- Namespace: payments\n\nProcedure is ready to execute."
-    )
-    assert status.messages[3] == f"Step completed: {STEP_1_TITLE}\n\nNamespace payments exists."
-    assert status.messages[4] == f"Step completed: {STEP_2_TITLE}\n\nFound 8 pods in namespace payments."
-    assert status.message == status.messages[4]
-
-
-# --- Only-one-step cases still work (procedure with no second step) --------
-
-def test_single_step_procedure_still_stops_after_step_1(config, extractor, step_executor):
+def test_single_step_procedure_completes_normally(config, step_executor):
     from app.procedure.parser import parse_procedure
 
     single_step_kb = """# Simple check
@@ -369,36 +340,105 @@ Done.
     status = asyncio.run(handle_procedure_input_reply("", context, config))
 
     step_executor.assert_awaited_once()
-    assert status.state == "first_step_completed"
-    assert status.context.status == "FIRST_STEP_COMPLETED"
+    assert status.state == "completed"
+    assert status.context.status == "COMPLETED"
+    assert status.messages[-1] == "Procedure completed successfully."
 
 
-# --- Unexpected executor failure handled safely (either step) --------------
+# --- UI order ----------------------------------------------------------------------
 
-def test_unexpected_step_2_failure_is_handled_safely(config, step_executor, caplog):
-    step_executor.side_effect = [SUCCESS_1, RuntimeError("Authorization: Bearer test-openshift-token")]
+def test_running_step_progress_stages_for_every_step(config, step_executor):
+    step_executor.side_effect = list(ALL_SUCCESS)
     context = make_ready_context()
 
     status = asyncio.run(handle_procedure_input_reply("payments", context, config))
 
-    assert status.state == "failed"
-    assert status.context.step_results[STEP_1_ID] == SUCCESS_1
-    assert status.context.step_results[STEP_2_ID].status == "FAILED"
-    assert "test-openshift-token" not in caplog.text
-    assert "test-openshift-token" not in status.message
+    assert status.progress_stages == (
+        f"Running: {STEP_1_TITLE}...", f"Running: {STEP_2_TITLE}...",
+        f"Running: {STEP_3_TITLE}...", f"Running: {STEP_4_TITLE}...", "Finishing up...",
+    )
+    assert status.messages == (
+        "Inputs collected:\n\n- Namespace: payments\n\nProcedure is ready to execute.",
+        f"Step completed: {STEP_1_TITLE}\n\nNamespace payments exists.",
+        f"Step completed: {STEP_2_TITLE}\n\nFound 8 pods in namespace payments.",
+        f"Step completed: {STEP_3_TITLE}\n\nNo warning events found.",
+        f"Step completed: {STEP_4_TITLE}\n\nAll deployments are healthy.",
+        "Procedure completed successfully.",
+    )
+    # progress_stages has exactly len(messages) - 1 entries.
+    assert len(status.progress_stages) == len(status.messages) - 1
+
+
+def test_completion_message_shown_exactly_once(config, step_executor):
+    step_executor.side_effect = list(ALL_SUCCESS)
+    context = make_ready_context()
+
+    status = asyncio.run(handle_procedure_input_reply("payments", context, config))
+
+    assert status.messages.count("Procedure completed successfully.") == 1
+    assert status.messages[-1] == "Procedure completed successfully."
+
+
+# --- Results preserved in context --------------------------------------------------
+
+def test_all_step_results_are_preserved_in_order(config, step_executor):
+    step_executor.side_effect = list(ALL_SUCCESS)
+    context = make_ready_context()
+
+    status = asyncio.run(handle_procedure_input_reply("payments", context, config))
+
+    assert status.context.step_results == {
+        STEP_1_ID: SUCCESS_1, STEP_2_ID: SUCCESS_2, STEP_3_ID: SUCCESS_3, STEP_4_ID: SUCCESS_4,
+    }
+    assert list(status.context.step_results) == ALL_STEP_IDS  # source order preserved
+    assert status.context.current_step_index == 4
+
+
+# --- Active-procedure cleanup / normal chat regression -----------------------------
+
+def test_only_fixed_steps_execute_for_a_four_step_procedure_started_fresh(
+    config, itsm_mcp, extractor, step_executor,
+):
+    start_procedure(config, itsm_mcp, KB_FOUR_STEPS)
+    extractor.return_value = {"namespace": "payments"}
+    step_executor.side_effect = list(ALL_SUCCESS)
+
+    status = asyncio.run(handle_procedure(
+        "/procedure inspect namespace health for namespace payments", config,
+    ))
+
+    assert status.state == "completed"
+    assert step_executor.await_count == 4
+    assert executed_step_ids(step_executor) == ALL_STEP_IDS
 
 
 # --- Logging makes the chaining decision visible ----------------------------
 
-def test_next_step_logging_and_no_raw_summary_leakage(config, step_executor, caplog):
+def test_logging_reflects_the_full_sequential_run(config, step_executor, caplog):
     import logging
     caplog.set_level(logging.INFO, logger="app")
-    step_executor.side_effect = [SUCCESS_1, SUCCESS_2]
+    step_executor.side_effect = list(ALL_SUCCESS)
     context = make_ready_context()
 
     asyncio.run(handle_procedure_input_reply("payments", context, config))
 
-    assert f"Procedure run=run-1 next_step={STEP_2_ID}" in caplog.text
-    assert "Procedure run=run-1 status=SECOND_STEP_COMPLETED" in caplog.text
+    assert "Procedure run=run-1 status=RUNNING steps=4" in caplog.text
+    for index, step_id in enumerate(ALL_STEP_IDS):
+        assert f"Procedure run=run-1 step_index={index} step={step_id} status=starting" in caplog.text
+        assert f"Procedure run=run-1 step={step_id} status=SUCCESS" in caplog.text
+    assert "Procedure run=run-1 status=COMPLETED" in caplog.text
+    # Step summaries are never logged, only run id / status / counts.
     assert "Namespace payments exists." not in caplog.text
     assert "Found 8 pods" not in caplog.text
+
+
+def test_logging_includes_the_stopping_step_id(config, step_executor, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="app")
+    stop_2 = StepResult(status="STOP", summary="No pods found; stopping.")
+    step_executor.side_effect = [SUCCESS_1, stop_2]
+    context = make_ready_context()
+
+    asyncio.run(handle_procedure_input_reply("payments", context, config))
+
+    assert f"Procedure run=run-1 status=STOPPED step={STEP_2_ID}" in caplog.text

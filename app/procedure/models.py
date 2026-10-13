@@ -5,9 +5,9 @@ iterations). The parsed-procedure types are small Pydantic models, kept
 intentionally free of any MCP-specific concepts (no tool/server/system
 names) so the KB stays independent from concrete MCP implementations.
 
-Only `procedure.steps[0]` and, if it succeeds, `procedure.steps[1]` are
-executed so far (see `app.procedure.executor`); the full step loop is not
-implemented yet.
+Every `procedure.steps` entry is executed in fixed KB order, one at a
+time, continuing only while each step returns SUCCESS (see
+`app.procedure.executor` and the generic loop in `app.procedure`).
 """
 from dataclasses import dataclass
 from typing import Literal
@@ -149,13 +149,15 @@ class ProcedureContext(BaseModel):
     plus anything deterministically validated from extraction).
 
     `status` tracks progress: input collection (`COLLECTING_INPUTS`,
-    `READY`), the outcome of executing the first/second step
-    (`FIRST_STEP_COMPLETED`, `SECOND_STEP_COMPLETED`, `STOPPED`, `FAILED`),
-    or `CANCELLED`. Only `procedure.steps[0]` and, if it succeeds,
-    `procedure.steps[1]` are ever executed so far; `current_step_index`
-    tracks the index of the last step executed and `step_results` holds
-    at most two entries this iteration, keyed by step id and never
-    overwriting an earlier step's stored result.
+    `READY`), step execution (`RUNNING`, set just before the first step
+    starts), a terminal outcome (`COMPLETED` once every step has
+    succeeded, `STOPPED`, `FAILED`), or `CANCELLED`. Steps run one at a
+    time, in fixed KB order, continuing only on SUCCESS; `current_step_index`
+    starts at 0 and advances past a step only once it succeeds, so on
+    STOP/FAILED it points at the step that stopped/failed the procedure.
+    `step_results` holds every executed step's result so far, keyed by
+    step id, in execution order, and never overwrites an earlier step's
+    stored result.
     """
 
     run_id: str
@@ -165,8 +167,7 @@ class ProcedureContext(BaseModel):
     procedure: ProcedureDefinition
     inputs: dict[str, PrimitiveValue] = {}
     status: Literal[
-        "COLLECTING_INPUTS", "READY", "FIRST_STEP_COMPLETED", "SECOND_STEP_COMPLETED",
-        "STOPPED", "FAILED", "CANCELLED",
+        "COLLECTING_INPUTS", "READY", "RUNNING", "COMPLETED", "STOPPED", "FAILED", "CANCELLED",
     ] = "COLLECTING_INPUTS"
     step_results: dict[str, StepResult] = {}
     current_step_index: int = 0
