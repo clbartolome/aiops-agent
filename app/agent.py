@@ -12,7 +12,7 @@ from openai import AsyncOpenAI
 
 from app.config import MAX_TURNS, Config
 from app.diagnostics import ProtocolTextError, log_failure, log_model_response
-from app.mcp import MCPConnectionError, create_mcp_servers
+from app.mcp import MCPConnectionError, create_mcp_servers, expose_allowed_mcp_tools
 from app.prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,13 @@ INVALID_MODEL_OUTPUT = (
     "The model returned invalid tool-protocol text instead of a usable answer. "
     "Please check the model/provider's tool-calling compatibility."
 )
+
+
+LIVE_TOOL_RETRY_INSTRUCTIONS = """The user's request requires current live system information.
+You MUST use the available MCP tools before answering.
+Do not answer from memory or prior knowledge.
+Select the MCP tool or tools needed to retrieve the requested current state.
+Base the final answer only on successful tool results."""
 
 
 def requires_live_data(message: str) -> bool:
@@ -105,42 +112,70 @@ async def run_agent(message: str, config: Config, session: Session | None = None
         )
         logger.info("MCP tool discovery starting")
         try:
+            await expose_allowed_mcp_tools(agent, config.mcp_servers)
             tools = await agent.get_all_tools(RunContextWrapper(context=None))
         except Exception as error:
             log_failure(logger, "MCP tool discovery failed", error, secrets)
             raise
-        logger.info("MCP tools exposed count=%d names=%s", len(tools), [tool.name for tool in tools])
+        logger.info("Agent tools exposed count=%d names=%s", len(tools), [tool.name for tool in tools])
+        retrying = False
+        run_input = message
         try:
-            result = await Runner.run(
-                agent, message, max_turns=MAX_TURNS, hooks=ToolDiagnostics(),
-                run_config=RunConfig(tracing_disabled=True), session=session,
-            )
+            for pass_index in range(2):
+                result = await Runner.run(
+                    agent, run_input, max_turns=MAX_TURNS, hooks=ToolDiagnostics(),
+                    run_config=RunConfig(tracing_disabled=True), session=None if retrying else session,
+                )
+                # Only this run's new items count as evidence, never session history.
+                question_calls = {
+                    item.raw_item.call_id for item in result.new_items
+                    if isinstance(item, ToolCallItem)
+                    and getattr(item.raw_item, "name", None) == request_user_input.name
+                }
+                outputs = [item for item in result.new_items if isinstance(item, ToolCallOutputItem)]
+                questions = [item for item in outputs if item.call_id in question_calls]
+                mcp_outputs = [item for item in outputs if item.call_id not in question_calls]
+                executed = any((item.custom_data or {}).get("mcp_executed") for item in mcp_outputs)
+                attempted = len(mcp_outputs)
+                succeeded = sum(
+                    bool((item.custom_data or {}).get("mcp_executed")
+                         and (item.custom_data or {}).get("mcp_success")) for item in mcp_outputs
+                )
+                failed = attempted - succeeded
+                logger.info(
+                    "MCP calls attempted=%d succeeded=%d failed=%d tool_executed=%s user_input_requested=%s",
+                    attempted, succeeded, failed, executed, bool(questions),
+                )
+                logger.info(
+                    "%s requires_live_evidence=%s mcp_attempted=%d mcp_succeeded=%d mcp_failed=%d",
+                    "Direct agent live-tool retry" if retrying else "Direct agent run",
+                    str(operational).lower(), attempted, succeeded, failed,
+                )
+                # Clarification is an intentional SDK stop, not skipped tool selection.
+                if pass_index == 0 and operational and not attempted and not questions:
+                    logger.info("Direct agent live-tool retry triggered reason=no_mcp_attempt")
+                    if session is not None:
+                        # Discard the unsupported response, keeping the original user
+                        # message once. Run internally without automatic session writes.
+                        for _ in result.new_items:
+                            await session.pop_item()
+                        run_input = await session.get_items()
+                    agent.instructions = SYSTEM_PROMPT + "\n\n" + LIVE_TOOL_RETRY_INSTRUCTIONS
+                    # Keep auto: the configured provider rejects required tool choice.
+                    retrying = True
+                    continue
+                if retrying and session is not None:
+                    await session.add_items([item.to_input_item() for item in result.new_items])
+                break
         except ProtocolTextError as error:
             log_failure(logger, "Invalid model response", error, secrets)
             final_output = INVALID_MODEL_OUTPUT
+            if retrying and session is not None:
+                await session.add_items([{"role": "assistant", "content": final_output}])
         except Exception as error:
             log_failure(logger, "Model/agent request failed", error, secrets)
             raise
         else:
-            question_calls = {
-                item.raw_item.call_id for item in result.new_items
-                if isinstance(item, ToolCallItem)
-                and getattr(item.raw_item, "name", None) == request_user_input.name
-            }
-            outputs = [item for item in result.new_items if isinstance(item, ToolCallOutputItem)]
-            questions = [item for item in outputs if item.call_id in question_calls]
-            mcp_outputs = [item for item in outputs if item.call_id not in question_calls]
-            executed = any((item.custom_data or {}).get("mcp_executed") for item in mcp_outputs)
-            attempted = len(mcp_outputs)
-            succeeded = sum(
-                bool((item.custom_data or {}).get("mcp_executed")
-                     and (item.custom_data or {}).get("mcp_success")) for item in mcp_outputs
-            )
-            failed = attempted - succeeded
-            logger.info(
-                "MCP calls attempted=%d succeeded=%d failed=%d tool_executed=%s user_input_requested=%s",
-                attempted, succeeded, failed, executed, bool(questions),
-            )
             evidence_required = operational or attempted > 0
             rejected = not questions and evidence_required and not succeeded
             logger.info(

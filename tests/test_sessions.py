@@ -282,3 +282,55 @@ def test_cancel_confirmation_is_persisted(monkeypatch):
             assert {"role": "user", "content": "/cancel"} in history
             assert {"role": "assistant", "content": "Procedure cancelled."} in history
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('outcome', ['success', 'failure', 'skipped', 'protocol_error'])
+def test_live_tool_retry_is_internal_and_preserves_history(model, config, mcp_boundary, outcome):
+    from app.agent import LIVE_TOOL_RETRY_INSTRUCTIONS, INVALID_MODEL_OUTPUT, run_agent
+    from app.diagnostics import ProtocolTextError
+    from app.sessions import visible_messages
+    from agents import SQLiteSession
+
+    initial_answer = 'UNVERIFIED initial answer'
+    final_answer = 'There are 3 pods.'
+
+    def respond(**kwargs):
+        if model.await_count == 1:
+            return answer(initial_answer)
+        assert LIVE_TOOL_RETRY_INSTRUCTIONS in kwargs['system_instructions']
+        assert initial_answer not in repr(kwargs['input'])
+        assert 'Earlier general discussion' in repr(kwargs['input'])
+        if outcome == 'protocol_error':
+            raise ProtocolTextError('invalid protocol')
+        if model.await_count == 2 and outcome != 'skipped':
+            return call(exposed_name(kwargs['tools'], 'openshift', 'get_pod_count'),
+                        {'namespace': 'openshift-mcp'})
+        return answer(final_answer)
+
+    model.side_effect = respond
+    if outcome == 'failure':
+        mcp_boundary.tool_results['openshift'] = RuntimeError('Query failed')
+
+    async def scenario():
+        session = SQLiteSession('retry-history')
+        try:
+            await session.add_items([{'role': 'user', 'content': 'Earlier general discussion'},
+                                     {'role': 'assistant', 'content': 'Earlier answer'}])
+            message = 'how many pods are in openshift-mcp namespace?'
+            result = await run_agent(message, config, session=session)
+            expected = (final_answer if outcome == 'success' else
+                        INVALID_MODEL_OUTPUT if outcome == 'protocol_error' else NO_LIVE_DATA)
+            assert result == expected
+            history = await visible_messages(session)
+            assert history == [
+                {'role': 'user', 'content': 'Earlier general discussion'},
+                {'role': 'assistant', 'content': 'Earlier answer'},
+                {'role': 'user', 'content': message},
+                {'role': 'assistant', 'content': expected},
+            ]
+            assert LIVE_TOOL_RETRY_INSTRUCTIONS not in repr(await session.get_items())
+            assert initial_answer not in repr(await session.get_items())
+        finally:
+            session.close()
+
+    asyncio.run(scenario())

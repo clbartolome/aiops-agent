@@ -63,9 +63,16 @@ def event_types(events: list[dict]) -> list[str]:
 @pytest.fixture
 def config():
     return Config("test-model", "http://localhost:11434/v1", "test-model-key", (
-        MCPConfig("openshift", "https://openshift.test/mcp", "test-openshift-token"),
-        MCPConfig("aap", "https://aap.test/mcp"),
-        MCPConfig("itsm", "https://itsm.test/mcp"),
+        MCPConfig("openshift", "https://openshift.test/mcp", "test-openshift-token", allowed_tools=frozenset({
+            "mcp_openshift__get_pod_count", "mcp_openshift__get_status", "mcp_openshift__delete_openshift",
+            "mcp_openshift__pods_list_in_namespace",
+        })),
+        MCPConfig("aap", "https://aap.test/mcp", allowed_tools=frozenset({
+            "mcp_aap__get_workflow_status", "mcp_aap__get_status", "mcp_aap__delete_aap",
+        })),
+        MCPConfig("itsm", "https://itsm.test/mcp", allowed_tools=frozenset({
+            "mcp_itsm__get_ticket", "mcp_itsm__get_status", "mcp_itsm__delete_itsm", "mcp_itsm__rag_search_kb",
+        })),
     ))
 
 

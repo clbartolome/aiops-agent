@@ -305,7 +305,7 @@ def test_no_tools_returns_controlled_response(model, config):
     model.return_value = answer("There are 2 pods in pepe.")
     result = asyncio.run(run_agent("How many pods are in pepe?", replace(config, mcp_servers=())))
     assert result == NO_LIVE_DATA
-    assert model.await_count == 1
+    assert model.await_count == 2  # One recovery pass, still no live evidence.
 
 
 def test_provider_rejecting_required_tool_choice_can_answer_with_auto(model, config, mcp_boundary):
@@ -440,7 +440,7 @@ def test_count_and_names_come_from_results(model, config, mcp_boundary):
 def test_workflow_distinctions_remain_in_single_prompt(model, config):
     model.return_value = answer("Do you mean workflow job templates or workflow executions?")
     asyncio.run(run_agent("How many workflows are there?", config))
-    prompt = model.call_args.kwargs["system_instructions"]
+    prompt = model.call_args_list[0].kwargs["system_instructions"]
     assert prompt == SYSTEM_PROMPT
     for term in ("workflow job templates", "workflow jobs", "workflow executions"):
         assert term in prompt
@@ -627,3 +627,74 @@ def test_live_namespace_query_failed_then_successful_call(model, config, mcp_bou
     assert asyncio.run(run_agent('hello', config)) == 'Hello!'
     model.return_value = answer('Namespace aap exists.')
     assert asyncio.run(run_agent('does namespace aap exist?', config)) == NO_LIVE_DATA
+
+
+@pytest.mark.parametrize('outcome', ['success', 'failure', 'skipped'])
+def test_one_live_tool_recovery_pass(model, config, mcp_boundary, monkeypatch, caplog, outcome):
+    from app.agent import LIVE_TOOL_RETRY_INSTRUCTIONS
+    caplog.set_level(logging.INFO, logger='app.agent')
+    mcp_boundary.definitions['openshift'] = ('pods_list_in_namespace', 'namespace')
+    mcp_boundary.tool_results['openshift'] = (
+        RuntimeError('Query failed') if outcome == 'failure' else
+        CallToolResult(content=[TextContent(type='text', text='{"pods": [{"name": "pod-1"}]}')])
+    )
+    runner = AsyncMock(wraps=agent_module.Runner.run)
+    monkeypatch.setattr(agent_module.Runner, 'run', runner)
+    message = 'how many pods are in openshift-mcp namespace?'
+
+    def respond(**kwargs):
+        if model.await_count == 1:
+            assert LIVE_TOOL_RETRY_INSTRUCTIONS not in kwargs['system_instructions']
+            return answer('There are 999 pods.')
+        assert LIVE_TOOL_RETRY_INSTRUCTIONS in kwargs['system_instructions']
+        if model.await_count == 2:
+            assert kwargs['model_settings'].tool_choice == 'auto'
+        if model.await_count == 2 and outcome != 'skipped':
+            return call(exposed_name(kwargs['tools'], 'openshift', 'pods_list_in_namespace'),
+                        {'namespace': 'openshift-mcp'})
+        return answer('There is 1 pod.')
+
+    model.side_effect = respond
+    assert asyncio.run(run_agent(message, config)) == ('There is 1 pod.' if outcome == 'success' else NO_LIVE_DATA)
+    assert runner.await_count == 2
+    assert runner.await_args_list[0].args[0] is runner.await_args_list[1].args[0]
+    assert runner.await_args_list[1].args[1] == message
+    assert 'Direct agent run requires_live_evidence=true mcp_attempted=0 mcp_succeeded=0' in caplog.text
+    assert caplog.text.count('live-tool retry triggered reason=no_mcp_attempt') == 1
+    attempted, succeeded = (0, 0) if outcome == 'skipped' else (1, int(outcome == 'success'))
+    assert (f'Direct agent live-tool retry requires_live_evidence=true mcp_attempted={attempted} '
+            f'mcp_succeeded={succeeded} mcp_failed={attempted - succeeded}') in caplog.text
+    # A single MCP lifecycle is reused for both runs.
+    assert len(mcp_boundary.servers) == len(config.mcp_servers)
+
+
+@pytest.mark.parametrize('message', ['hello', 'what is a pod?', 'what is a Kubernetes pod?'])
+def test_conceptual_answer_never_triggers_retry(model, config, monkeypatch, message):
+    runner = AsyncMock(wraps=agent_module.Runner.run)
+    monkeypatch.setattr(agent_module.Runner, 'run', runner)
+    model.return_value = answer('General answer.')
+    assert asyncio.run(run_agent(message, config)) == 'General answer.'
+    assert runner.await_count == 1
+
+
+@pytest.mark.parametrize('tool_results', ['success', 'failed', 'recoverable'])
+def test_attempted_mcp_work_never_retried(model, config, mcp_boundary, monkeypatch, tool_results):
+    runner = AsyncMock(wraps=agent_module.Runner.run)
+    monkeypatch.setattr(agent_module.Runner, 'run', runner)
+    if tool_results == 'failed':
+        mcp_boundary.tool_results['openshift'] = RuntimeError('Query failed')
+
+    def respond(**kwargs):
+        if model.await_count == 1 or (tool_results == 'recoverable' and model.await_count == 2):
+            response = call(exposed_name(kwargs['tools'], 'openshift', 'get_pod_count'),
+                            {} if tool_results == 'recoverable' and model.await_count == 1 else
+                            {'namespace': 'openshift-mcp'})
+            response.output[0].call_id = f'call_{model.await_count}'
+            return response
+        return answer('There are 3 pods.')
+
+    model.side_effect = respond
+    assert asyncio.run(run_agent('how many pods are in openshift-mcp namespace?', config)) == (
+        NO_LIVE_DATA if tool_results == 'failed' else 'There are 3 pods.'
+    )
+    assert runner.await_count == 1

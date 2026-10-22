@@ -53,7 +53,7 @@ from openai import AsyncOpenAI
 from app.agent import ToolDiagnostics
 from app.config import MAX_TURNS, Config
 from app.diagnostics import ProtocolTextError, log_failure
-from app.mcp import MCPConnectionError, create_mcp_servers
+from app.mcp import MCPConnectionError, create_mcp_servers, expose_allowed_mcp_tools
 from app.procedure.models import (
     PrimitiveValue, ProcedureInput, ProcedureStep, StepExecutionContext, StepResult,
 )
@@ -180,6 +180,7 @@ async def _run_operational_phase(
             mcp_config={"include_server_in_tool_names": True},
             model_settings=ModelSettings(tool_choice="auto"),
         )
+        await expose_allowed_mcp_tools(agent, config.mcp_servers)
         prompt = _operational_prompt(step, declared, collected, original_request, previous_results)
         try:
             result = await Runner.run(
