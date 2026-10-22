@@ -580,3 +580,50 @@ def test_multiple_failed_mcp_calls_still_reject_factual_answer(model, config, mc
     mcp_boundary.sessions["openshift"].call_tool.assert_awaited_once()
     mcp_boundary.sessions["aap"].call_tool.assert_awaited_once()
     assert "MCP calls attempted=2 succeeded=0 failed=2" in caplog.text
+
+
+@pytest.mark.parametrize('message', [
+    'hello', 'what can you help me with?', 'explain what namespaces are',
+    'explain what an OpenShift namespace is', 'explain what a Kubernetes deployment is',
+    'how would you troubleshoot a failing pod?', 'what is an Ansible workflow template?',
+])
+def test_general_chat_does_not_require_live_evidence(model, config, mcp_boundary, caplog, message):
+    caplog.set_level(logging.INFO, logger='app.agent')
+    model.return_value = answer('A general explanation.')
+    assert asyncio.run(run_agent(message, config)) == 'A general explanation.'
+    assert 'Direct agent response allowed requires_live_evidence=false mcp_attempted=0' in caplog.text
+    for session in mcp_boundary.sessions.values():
+        session.call_tool.assert_not_awaited()
+
+
+@pytest.mark.parametrize('message', [
+    'does namespace aap exist?', 'what pods are running in namespace payments?',
+    'what is the status of deployment checkout?',
+    'what namespaces currently exist in my OpenShift cluster?',
+    'explain what namespaces are and show current namespaces',
+])
+def test_live_questions_still_require_evidence(model, config, message, caplog):
+    caplog.set_level(logging.INFO, logger='app.agent')
+    model.return_value = answer('An unsupported infrastructure claim.')
+    assert asyncio.run(run_agent(message, config)) == NO_LIVE_DATA
+    assert 'Direct agent response rejected requires_live_evidence=true' in caplog.text
+
+
+@pytest.mark.parametrize('recover', [False, True])
+def test_live_namespace_query_failed_then_successful_call(model, config, mcp_boundary, recover):
+    def respond(**kwargs):
+        if model.await_count == 1 or (recover and model.await_count == 2):
+            response = call(exposed_name(kwargs['tools'], 'openshift', 'get_pod_count'),
+                            {} if model.await_count == 1 else {'namespace': 'aap'})
+            response.output[0].call_id = f'attempt_{model.await_count}'
+            return response
+        return answer('Namespace aap exists.')
+    model.side_effect = respond
+    result = asyncio.run(run_agent('does namespace aap exist?', config))
+    assert result == ('Namespace aap exists.' if recover else NO_LIVE_DATA)
+    # A later run cannot inherit success or failure counts from this run.
+    model.side_effect = None
+    model.return_value = answer('Hello!')
+    assert asyncio.run(run_agent('hello', config)) == 'Hello!'
+    model.return_value = answer('Namespace aap exists.')
+    assert asyncio.run(run_agent('does namespace aap exist?', config)) == NO_LIVE_DATA

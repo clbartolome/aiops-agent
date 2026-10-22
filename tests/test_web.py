@@ -701,3 +701,49 @@ def test_exact_procedure_reply_is_routed_and_saved(agent, config, monkeypatch):
     assert extractor.await_args.args[0] == 'virtual machine name: server-01'
     assert conversation.active_procedure.inputs == {'virtual_machine_name': 'server-01'}
     agent.assert_not_awaited()
+
+
+@pytest.mark.parametrize('terminal', ['COMPLETED', 'STOPPED', 'FAILED', 'CANCELLED'])
+def test_terminal_procedure_clears_association_and_returns_to_chat(
+    agent, procedure_lifecycle, config, terminal, caplog,
+):
+    import logging
+    from app.procedure.models import ProcedureStatus
+    from app.sessions import Conversation
+    caplog.set_level(logging.INFO, logger='app.web')
+    conversation = Conversation()
+    conversation.session = SimpleNamespace(add_items=AsyncMock())
+    web.conversations[conversation.session_id] = conversation
+    procedure_lifecycle.start.return_value = ProcedureStatus(
+        state=terminal.lower(), message='Done.', context=make_procedure_context(status=terminal),
+    )
+    path = f'/api/sessions/{conversation.session_id}/messages'
+    response = request('POST', path, json={'message': '/procedure inspect namespace health'})
+    assert response.status_code == 200
+    assert conversation.active_procedure is None
+    response = request('POST', path, json={'message': 'hello'})
+    assert response.json() == {'response': agent.return_value}
+    agent.assert_awaited_once_with('hello', config, session=conversation.session)
+    procedure_lifecycle.reply.assert_not_called()
+    assert f'session={conversation.session_id} route=procedure' in caplog.text
+    assert f'session={conversation.session_id} route=operations_agent' in caplog.text
+
+
+@pytest.mark.parametrize('message', ['hello', 'explain what namespaces are', 'what can you help me with?'])
+def test_waiting_procedure_in_another_session_does_not_intercept_chat(
+    agent, procedure_lifecycle, config, caplog, message,
+):
+    import logging
+    from app.sessions import Conversation
+    caplog.set_level(logging.INFO, logger='app.web')
+    first, second = Conversation(), Conversation()
+    first.active_procedure = make_procedure_context()
+    web.conversations[first.session_id] = first
+    web.conversations[second.session_id] = second
+    response = request('POST', f'/api/sessions/{second.session_id}/messages', json={'message': message})
+    assert response.json() == {'response': agent.return_value}
+    agent.assert_awaited_once_with(message, config, session=second.session)
+    procedure_lifecycle.start.assert_not_called()
+    procedure_lifecycle.reply.assert_not_called()
+    assert first.active_procedure.status == 'COLLECTING_INPUTS'
+    assert f'session={second.session_id} route=operations_agent' in caplog.text

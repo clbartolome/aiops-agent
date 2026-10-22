@@ -21,6 +21,7 @@ from app.sessions import Conversation, timestamp, visible_messages
 
 configure_logging()
 conversations: dict[str, Conversation] = {}
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -117,13 +118,19 @@ async def _stream_procedure(
             # unexpected happened mid-stream. Never leave a stale progress
             # bubble or a half-open connection -- clear it and end cleanly.
             log_failure(logging.getLogger(__name__), "Procedure event stream failed", error, ())
+            if conversation is not None:
+                conversation.active_procedure = None
             yield _encode_event({"type": "procedure_progress_clear"})
             yield _encode_event({"type": "procedure_status", "state": "error",
                                   "message": "The procedure could not be completed."})
             return
         if final_status is not None:
             if conversation is not None:
-                conversation.active_procedure = final_status.context
+                conversation.active_procedure = (
+                    final_status.context if final_status.context is not None
+                    and final_status.context.status in {"COLLECTING_INPUTS", "READY", "RUNNING"}
+                    else None
+                )
             yield _encode_event(procedure_payload(final_status))
 
 
@@ -147,6 +154,14 @@ async def route_message(request: ChatRequest, conversation: Conversation | None)
         raise HTTPException(503, "Check the server's environment configuration.") from None
 
     active = conversation.active_procedure if conversation is not None else None
+    if active is not None and active.status in {"COMPLETED", "STOPPED", "FAILED", "CANCELLED"}:
+        conversation.active_procedure = None
+        active = None
+    procedure_route = (is_procedure_command(request.message) or (
+        active is not None and (active.status == "COLLECTING_INPUTS" or is_cancel_command(request.message))
+    ))
+    logger.info("session=%s route=%s", conversation.session_id if conversation else "stateless",
+                "procedure" if procedure_route else "operations_agent")
 
     if active is not None and is_cancel_command(request.message):
         lock_cm = conversation.lock if conversation is not None else nullcontext()

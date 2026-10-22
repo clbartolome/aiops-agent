@@ -1,4 +1,5 @@
 import logging
+import re
 from urllib.parse import urlsplit
 
 from agents import (
@@ -38,14 +39,26 @@ INVALID_MODEL_OUTPUT = (
 
 
 def requires_live_data(message: str) -> bool:
-    # Only unambiguous general questions bypass the requirement. Mixed or unknown
-    # requests default to requiring tools; no extra model/router is involved.
-    general_questions = {
+    """Exempt clearly general questions; keep ambiguous/live requests guarded.
+
+    This only controls evidence validation, never SDK tools or routing.
+    """
+    text = " ".join(message.lower().split()).rstrip(".!?")
+    if text in {
         "hello", "hi", "hey", "thanks", "thank you",
-        "what can you do", "what can you check",
-        "what is a kubernetes pod", "explain what a kubernetes pod is",
-    }
-    return " ".join(message.lower().split()).rstrip(".!?") not in general_questions
+        "what can you do", "what can you check", "what can you help me with",
+    }:
+        return False
+    # Do not exempt mixed requests or explanations of a particular incident.
+    if re.search(
+        r"[.!?;]|\b(my|our|currently|current|now|today|actually|live|"
+        r"check|show|list|retrieve|does|exists?|running)\b", text,
+    ):
+        return True
+    return not bool(re.fullmatch(
+        r"(?:explain what .+ (?:is|are)|what (?:is|are) (?:a|an) .+|"
+        r"how would you troubleshoot (?:a|an) .+)", text,
+    ))
 
 
 # This provider's Harmony parser rejects strict tool-schema enforcement.
@@ -128,9 +141,15 @@ async def run_agent(message: str, config: Config, session: Session | None = None
                 "MCP calls attempted=%d succeeded=%d failed=%d tool_executed=%s user_input_requested=%s",
                 attempted, succeeded, failed, executed, bool(questions),
             )
+            evidence_required = operational or attempted > 0
+            rejected = not questions and evidence_required and not succeeded
+            logger.info(
+                "Direct agent response %s requires_live_evidence=%s mcp_attempted=%d mcp_succeeded=%d",
+                "rejected" if rejected else "allowed", str(evidence_required).lower(), attempted, succeeded,
+            )
             if questions:
                 final_output = questions[0].output
-            elif operational and not succeeded:
+            elif rejected:
                 final_output = NO_LIVE_DATA
             else:
                 final_output = result.final_output

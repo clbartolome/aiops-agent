@@ -331,3 +331,26 @@ def test_no_previous_results_omits_the_section_entirely(model, config, mcp_bound
     asyncio.run(execute_step("run-1", STEP, DECLARED, COLLECTED, "", config, previous_results=[]))
 
     assert "Previous completed steps" not in captured["prompt"]
+
+
+def test_failed_step_evidence_does_not_leak_into_direct_agent(model, config, mcp_boundary, caplog):
+    import logging
+    from app.agent import run_agent
+    caplog.set_level(logging.INFO, logger='app.agent')
+    mcp_boundary.tool_results['openshift'] = RuntimeError('Query failed')
+
+    def respond(**kwargs):
+        if is_operational(kwargs):
+            if model.await_count == 1:
+                return call(exposed_name(kwargs['tools'], 'openshift', 'get_pod_count'),
+                            {'namespace': 'payments'})
+            return answer('Unable to retrieve data.')
+        return structured_answer('FAILED', 'Unable to retrieve data.')
+
+    model.side_effect = respond
+    result = asyncio.run(execute_step('run-isolation', STEP, DECLARED, COLLECTED, '', config))
+    assert result.status == 'FAILED'
+    model.side_effect = None
+    model.return_value = answer('Hello!')
+    assert asyncio.run(run_agent('hello', config)) == 'Hello!'
+    assert 'requires_live_evidence=false mcp_attempted=0 mcp_succeeded=0' in caplog.text
