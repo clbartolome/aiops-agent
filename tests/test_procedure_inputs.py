@@ -445,3 +445,92 @@ def test_no_openshift_or_aap_tool_is_ever_called(config, itsm_mcp, extractor, st
     # The only MCP tool call observed anywhere in input collection is the fixed KB search.
     assert itsm_mcp.calls == [("rag_search_kb", {"query": "inspect checkout in namespace payments"})]
     step_executor.assert_awaited_once()
+
+KB_VM_INPUTS = KB_TWO_INPUTS.replace(
+    '- **Namespace** — required — OpenShift namespace containing the application.\n'
+    '- **Application name** — required — Name of the application to inspect.',
+    '- **Virtual Machine name** — required — VM name.\n'
+    '- **Virtual Machine CPUs** — required — CPU count.\n'
+    '- **Virtual Machine memory** — required — Memory in GiB.\n'
+    '- **Application Repository** — required — Repository URL.',
+)
+
+
+def test_latest_exact_reply_reaches_extractor_and_persists(config, extractor):
+    context = make_context(KB_VM_INPUTS)
+    context.original_request = '/procedure deploy stack'
+    extractor.return_value = {'virtual_machine_name': 'server-01'}
+    _, status = run_reply('virtual machine name: server-01', context, config)
+    assert extractor.await_args.args[0] == 'virtual machine name: server-01'
+    assert status.context.inputs == {'virtual_machine_name': 'server-01'}
+    assert 'Virtual Machine name' not in status.message
+    extractor.return_value = {}
+    _, next_status = run_reply('unsure', status.context, config)
+    assert next_status.context.inputs == status.context.inputs
+    assert 'virtual_machine_name' not in {i.name for i in extractor.await_args.args[1]}
+
+
+@pytest.mark.parametrize('reply', [
+    'virtual machine name: server-01',
+    'Virtual Machine name = server-01',
+    'virtual machine name is server-01',
+])
+def test_real_explicit_extractor_without_provider(reply, config, monkeypatch):
+    from app.procedure import extractor as module
+    client = AsyncMock(side_effect=AssertionError('No provider needed'))
+    monkeypatch.setattr(module, 'AsyncOpenAI', client)
+    values = asyncio.run(module.extract_procedure_inputs(
+        reply, make_context(KB_VM_INPUTS).procedure.inputs, config,
+    ))
+    assert values == {'virtual_machine_name': 'server-01'}
+    client.assert_not_called()
+
+
+def test_extraction_schema_declares_only_current_keys():
+    from app.procedure.extractor import extraction_schema, _declared_inputs_block
+    from pydantic import ValidationError
+    inputs = make_context(KB_VM_INPUTS).procedure.inputs
+    schema = extraction_schema(inputs)
+    assert set(schema.model_fields) == {i.name for i in inputs}
+    assert schema(virtual_machine_cpus=1).model_dump(exclude_none=True) == {'virtual_machine_cpus': 1}
+    with pytest.raises(ValidationError):
+        schema(unknown='value')
+    block = _declared_inputs_block(inputs)
+    for item in inputs:
+        assert item.name in block and item.label in block and item.description in block
+
+
+def test_invalid_values_do_not_replace_collected_inputs(config, extractor):
+    context = make_context(KB_VM_INPUTS, {'virtual_machine_name': 'server-01'})
+    extractor.return_value = {'virtual_machine_name': None, 'virtual_machine_cpus': None,
+                              'virtual_machine_memory': [], 'application_repository': ''}
+    _, status = run_reply('unsure', context, config)
+    assert status.context.inputs == context.inputs
+
+
+def test_natural_multi_value_reply_uses_constrained_model(config, monkeypatch):
+    from app.procedure import extractor as module
+    inputs = make_context(KB_VM_INPUTS).procedure.inputs
+    reply = ('the virtual machine name is server-01.\n'
+             'We need 1 cpu, 1 GiB memory and the application repository is https://example/repo.git')
+    expected = {'virtual_machine_name': 'server-01', 'virtual_machine_cpus': 1,
+                'virtual_machine_memory': 1, 'application_repository': 'https://example/repo.git'}
+
+    async def model_run(agent, prompt, **kwargs):
+        assert reply in prompt
+        assert 'Use the internal field names exactly as provided.' in agent.instructions
+        assert agent.tools == [] and agent.mcp_servers == []
+        schema = agent.output_type.output_type
+        assert set(schema.model_fields) == set(expected)
+        return SimpleNamespace(final_output=schema(**expected))
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(module, 'AsyncOpenAI', lambda **kwargs: Client())
+    monkeypatch.setattr(module.Runner, 'run', model_run)
+    assert asyncio.run(module.extract_procedure_inputs(reply, inputs, config)) == expected

@@ -80,7 +80,7 @@ from app.config import Config
 from app.diagnostics import log_failure
 from app.mcp import create_mcp_servers
 from app.procedure.executor import execute_step
-from app.procedure.extractor import extract_procedure_inputs
+from app.procedure.extractor import explicit_input_values, extract_procedure_inputs
 from app.procedure.models import (
     KBResult, PrimitiveValue, ProcedureContext, ProcedureDefinition, ProcedureInput, ProcedureStep,
     ProcedureRequest, ProcedureStatus, StepExecutionContext, StepResult,
@@ -251,7 +251,9 @@ def _filter_declared(extracted: dict, declared_names: set[str]) -> dict[str, Pri
     This is the deterministic rejection of "unknown fields" required by the
     extraction contract; the model never decides what counts as valid.
     """
-    return {name: value for name, value in extracted.items() if name in declared_names}
+    return {name: value for name, value in extracted.items() if name in declared_names
+            and type(value) in (str, int, float, bool)
+            and (not isinstance(value, str) or value.strip())}
 
 
 def _missing_required(procedure: ProcedureDefinition, collected: dict[str, PrimitiveValue]) -> list[ProcedureInput]:
@@ -482,7 +484,8 @@ async def _extract_and_merge(
 
     declared_names = {item.name for item in targets}
     filtered = _filter_declared(extracted, declared_names)
-    logger.info("Procedure run=%s inputs_extracted=%s", run_id, sorted(filtered))
+    logger.info("Procedure run=%s inputs_extracted=%s inputs_rejected=%s",
+                run_id, sorted(filtered), sorted(set(extracted) - set(filtered)))
     merged = {**collected, **filtered}
     return merged, False
 
@@ -498,7 +501,8 @@ async def _settle(context: ProcedureContext, collected: dict[str, PrimitiveValue
     """
     procedure = context.procedure
     missing = _missing_required(procedure, collected)
-    logger.info("Procedure run=%s missing_inputs=%s", context.run_id, [item.name for item in missing])
+    logger.info("Procedure run=%s inputs_collected=%s missing_after=%s",
+                context.run_id, sorted(collected), [item.name for item in missing])
 
     if missing:
         logger.info("Procedure run=%s status=COLLECTING_INPUTS", context.run_id)
@@ -638,8 +642,9 @@ async def handle_procedure_input_reply(
     values are always preserved unless this reply clearly supplies a
     replacement.
     """
-    logger.info("Procedure run=%s input_reply_received", context.run_id)
     missing = _missing_required(context.procedure, context.inputs)
+    logger.info("Procedure run=%s input_reply_received=true missing_before=%s",
+                context.run_id, [item.name for item in missing])
 
     if not missing:
         # Nothing left to extract -- settle directly with no extraction
@@ -656,7 +661,8 @@ async def handle_procedure_input_reply(
         reply = message.strip()
         if reply:
             item = missing[0]
-            collected = {**context.inputs, item.name: coerce_primitive(reply)}
+            collected = {**context.inputs, **(explicit_input_values(reply, missing)
+                         or {item.name: coerce_primitive(reply)})}
             logger.info("Procedure run=%s inputs_extracted=%s", context.run_id, [item.name])
         else:
             collected = context.inputs

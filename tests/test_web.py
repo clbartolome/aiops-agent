@@ -680,3 +680,24 @@ Done.
         assert remaining[-1]["state"] == "completed"
 
     asyncio.run(scenario())
+
+
+def test_exact_procedure_reply_is_routed_and_saved(agent, config, monkeypatch):
+    import app.procedure as procedure_module
+    from tests.test_procedure_inputs import KB_VM_INPUTS, make_context
+    from app.sessions import Conversation
+
+    monkeypatch.setattr(web, 'load_config', lambda: config)
+    conversation = Conversation()
+    conversation.session = SimpleNamespace(add_items=AsyncMock())
+    conversation.active_procedure = make_context(KB_VM_INPUTS)
+    web.conversations[conversation.session_id] = conversation
+    extractor = AsyncMock(return_value={'virtual_machine_name': 'server-01'})
+    monkeypatch.setattr(procedure_module, 'extract_procedure_inputs', extractor)
+    response = request('POST', f'/api/sessions/{conversation.session_id}/messages',
+                       json={'message': 'virtual machine name: server-01'})
+    assert response.status_code == 200
+    extractor.assert_awaited_once()
+    assert extractor.await_args.args[0] == 'virtual machine name: server-01'
+    assert conversation.active_procedure.inputs == {'virtual_machine_name': 'server-01'}
+    agent.assert_not_awaited()

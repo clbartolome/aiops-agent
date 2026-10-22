@@ -8,14 +8,20 @@ confident about. All validation of the result (declared-field membership,
 supported types, missing-value detection) happens afterward in plain
 Python — see `app.procedure` — never in the model.
 """
+import re
+
 from agents import AgentOutputSchema, Agent, ModelSettings, OpenAIChatCompletionsModel, RunConfig, Runner
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from app.config import Config
 from app.procedure.models import PrimitiveValue, ProcedureInput
+from app.procedure.parser import coerce_primitive
 
 EXTRACTION_INSTRUCTIONS = """Extract values only for the declared procedure inputs.
+
+Use the internal field names exactly as provided.
 
 Use only values explicitly stated or unambiguously implied by the user's message.
 
@@ -27,10 +33,28 @@ You have no tools. Never execute anything and never answer the user
 conversationally; only return the structured extraction result."""
 
 
-class ExtractedProcedureInputs(BaseModel):
-    """Strictly structured extraction output: declared input name -> value."""
+def explicit_input_values(text: str, declared: list[ProcedureInput]) -> dict[str, PrimitiveValue]:
+    """Recognize only complete lines with an explicit declared label and value."""
+    values = {}
+    for item in declared:
+        pattern = re.compile(
+            rf"^\s*{re.escape(item.label)}\s*(?::|=|\bis\b)\s*(\S[^\n]*)$",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        for match in pattern.finditer(text):
+            values[item.name] = coerce_primitive(match.group(1))
+    return values
 
-    values: dict[str, PrimitiveValue] = {}
+
+def extraction_schema(declared: list[ProcedureInput]) -> type[BaseModel]:
+    """Constrain model keys to this turn's fields; KB inputs have no type metadata."""
+    return create_model(
+        "ExtractedProcedureInputs",
+        __config__=ConfigDict(extra="forbid"),
+        **{item.name: (PrimitiveValue | None, Field(default=None, description=(
+            f"{item.label}: {item.description or ''}"
+        ))) for item in declared},
+    )
 
 
 def _declared_inputs_block(declared: list[ProcedureInput]) -> str:
@@ -57,6 +81,14 @@ async def extract_procedure_inputs(
     if not declared or not text.strip():
         return {}
 
+    explicit = explicit_input_values(text, declared)
+    # A reply consisting entirely of explicit pairs needs no model call.
+    if explicit and all(
+        explicit_input_values(line, declared) for line in text.splitlines() if line.strip()
+    ):
+        return explicit
+    declared = [item for item in declared if item.name not in explicit]
+    schema = extraction_schema(declared)
     prompt = f"User text:\n{text}\n\nDeclared inputs:\n{_declared_inputs_block(declared)}"
 
     async with AsyncOpenAI(base_url=config.model_base_url, api_key=config.model_api_key) as client:
@@ -69,10 +101,7 @@ async def extract_procedure_inputs(
             ),
             tools=[],
             mcp_servers=[],
-            # This provider's strict-JSON-schema enforcement rejects the
-            # open `dict[str, ...]` values mapping; relax schema strictness
-            # only (the SDK still validates the Pydantic model locally).
-            output_type=AgentOutputSchema(ExtractedProcedureInputs, strict_json_schema=False),
+            output_type=AgentOutputSchema(schema),
             model_settings=ModelSettings(tool_choice="none"),
         )
         result = await Runner.run(
@@ -80,6 +109,6 @@ async def extract_procedure_inputs(
         )
 
     output = result.final_output
-    if isinstance(output, ExtractedProcedureInputs):
-        return dict(output.values)
-    return {}
+    if isinstance(output, schema):
+        return {**output.model_dump(exclude_none=True), **explicit}
+    return explicit

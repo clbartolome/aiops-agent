@@ -304,3 +304,39 @@ def test_success_criteria_absent_when_no_success_section():
 ])
 def test_normalize_name(label, expected):
     assert normalize_name(label) == expected
+
+
+@pytest.mark.parametrize('ending', ['\n## Success\n\nStack deployed.', ''])
+def test_three_step_stack_final_step_boundary(ending):
+    # Structural regression from the reported headings; the source KB is
+    # external to this repository, so this is not a verbatim KB fixture.
+    content = '''# Deploy Generic Application Stack
+
+## Procedure
+
+**ID:** deploy-generic-application-stack
+**Version:** 1
+**Risk:** medium
+**Confirmation required:** no
+
+## Steps
+
+### 1. Create the ITSM service request
+
+Create the service request.
+
+### 2. Find the deployment workflow
+
+Find the workflow.
+
+### 3. Launch the deployment workflow
+
+Launch the workflow.
+'''
+    procedure = parse_procedure(content + ending)
+    assert [step.id for step in procedure.steps] == [
+        'create_the_itsm_service_request',
+        'find_the_deployment_workflow',
+        'launch_the_deployment_workflow',
+    ]
+    assert procedure.steps[-1].instruction == 'Launch the workflow.'
