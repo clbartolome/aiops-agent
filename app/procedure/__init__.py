@@ -12,6 +12,7 @@ helpers in this module.
 The flow is:
 
     /procedure request -> rag_search_kb -> KB found -> parse that exact KB
+        -> WAITING_FOR_CONFIRMATION -> explicit human approval
         -> apply declared defaults -> extract input values from the
         original request -> determine missing required inputs
         -> ask only for what is missing -> repeat on each reply
@@ -432,8 +433,8 @@ async def _execute_steps(
     past a step once it has returned SUCCESS, so on STOP/FAILED it is left
     pointing at the step that stopped/failed the procedure.
     """
-    if context.source == "incident" and not context.confirmed:
-        raise ValueError("Incident execution requires explicit human confirmation.")
+    if not context.confirmed:
+        raise ValueError("Procedure execution requires explicit human confirmation.")
     procedure = context.procedure
     logger.info("Procedure run=%s status=RUNNING steps=%d", context.run_id, len(procedure.steps))
     current_context = context.model_copy(update={"status": "RUNNING", "current_step_index": 0})
@@ -501,6 +502,10 @@ async def _settle(context: ProcedureContext, collected: dict[str, PrimitiveValue
     natural-language summary once the procedure reaches a terminal state
     (COMPLETED/STOPPED/FAILED). Ends with the terminal `ProcedureStatus`.
     """
+    if not context.confirmed:
+        async for event in _wait_for_confirmation(context):
+            yield event
+        return
     procedure = context.procedure
     missing = _missing_required(procedure, collected)
     logger.info("Procedure run=%s inputs_collected=%s missing_after=%s",
@@ -513,16 +518,6 @@ async def _settle(context: ProcedureContext, collected: dict[str, PrimitiveValue
         new_context = context.model_copy(update={"inputs": collected, "status": "COLLECTING_INPUTS"})
         yield _message(message)
         yield ProcedureStatus(state="collecting_inputs", message=message, title=context.kb_title, context=new_context)
-        return
-
-    # This gate is shared by initial preparation AND missing-input replies.
-    # KB confirmation metadata cannot override incident provenance.
-    if context.source == "incident" and not context.confirmed:
-        waiting = context.model_copy(update={"inputs": collected, "status": "WAITING_FOR_CONFIRMATION"})
-        message = _confirmation_message(waiting)
-        yield _message(message)
-        yield ProcedureStatus(state="waiting_for_confirmation", message=message,
-                              title=context.kb_title, context=waiting)
         return
 
     logger.info("Procedure run=%s status=READY", context.run_id)
@@ -574,10 +569,9 @@ async def handle_procedure(message: str, config: Config) -> AsyncIterator[Proced
     with the terminal `ProcedureStatus` for this turn.
 
     Flow: extract the query -> call `rag_search_kb` once -> parse the KB
-    deterministically (no LLM, no second MCP call) -> apply declared
-    defaults -> extract any remaining input values from the original
-    request text -> ask for whatever required input is still missing, or
-    -- once READY -- execute every step in turn and report each result.
+    deterministically (no LLM, no second MCP call) -> show the proposal
+    and wait for human approval. Only approval starts input collection
+    and, once all required inputs are available, sequential execution.
     """
     query = extract_procedure_query(message)
     if not query:
@@ -592,7 +586,7 @@ async def handle_procedure(message: str, config: Config) -> AsyncIterator[Proced
 async def prepare_procedure(
     request_text: str, config: Config, *, source: str = "user", source_id: str | None = None,
 ) -> AsyncIterator[ProcedureEvent | ProcedureStatus]:
-    """One retrieval/parser/extractor entry point for user and incident requests."""
+    """Shared discovery and parsing; always pause before input extraction."""
     query = request_text.strip()
     message = request_text
     no_result = ("No matching procedure was found for this incident."
@@ -626,37 +620,51 @@ async def prepare_procedure(
     yield _progress(PARSING_PROCEDURE_STAGE)
     procedure, outcome = _parse_kb_procedure(request.kb)
     yield _PROGRESS_CLEAR
-    yield _message(outcome)
 
     if procedure is None:
+        yield _message(outcome)
         yield ProcedureStatus(state="parse_error", message=outcome, title=request.kb.title)
         return
 
-    run_id = str(uuid4())
+    context = ProcedureContext(
+        source=source, source_id=source_id, run_id=str(uuid4()), original_request=query,
+        kb_title=request.kb.title, kb_content=request.kb.content, procedure=procedure,
+        status="WAITING_FOR_CONFIRMATION",
+    )
+    async for event in _wait_for_confirmation(context):
+        yield event
+
+
+async def _wait_for_confirmation(context):
+    waiting = context.model_copy(update={"status": "WAITING_FOR_CONFIRMATION"})
+    message = _confirmation_message(waiting)
+    yield _PROGRESS_CLEAR
+    yield _message(message)
+    yield ProcedureStatus(state="waiting_for_confirmation", message=message,
+                          title=context.kb_title, context=waiting)
+
+
+async def _collect_initial_inputs(context, config):
+    """Only approval enters extraction; reuse the parsed definition and text."""
+    if not context.confirmed:
+        raise ValueError("Parameter collection requires explicit human confirmation.")
+    procedure = context.procedure
     collected = _apply_defaults(procedure)
     remaining = [item for item in procedure.inputs if item.name not in collected]
-
     extraction_failed = False
-    if remaining and query:
+    if remaining and context.original_request:
         yield _progress(EXTRACTING_PARAMETERS_STAGE)
-        collected, extraction_failed = await _extract_and_merge(run_id, query, remaining, collected, config)
+        collected, extraction_failed = await _extract_and_merge(
+            context.run_id, context.original_request, remaining, collected, config)
         yield _PROGRESS_CLEAR
-
-    context = ProcedureContext(
-        source=source, source_id=source_id,
-        run_id=run_id, original_request=query, kb_title=request.kb.title, kb_content=request.kb.content,
-        procedure=procedure, inputs=collected, status="COLLECTING_INPUTS",
-    )
-    if source == "incident":
+    if context.source == "incident":
         identified = {name: value for name, value in collected.items() if name not in _apply_defaults(procedure)}
         if identified:
             lines = ["Incident parameters identified:", ""]
             lines.extend(f"- {item.label}: {identified[item.name]}" for item in procedure.inputs if item.name in identified)
             yield _message("\n".join(lines))
-    collector = _Collector()
-    async for event in collector.forward(_settle(context, collected, extraction_failed, remaining, config)):
+    async for event in _settle(context, collected, extraction_failed, remaining, config):
         yield event
-    yield collector.value
 
 
 async def handle_procedure_input_reply(
@@ -675,6 +683,10 @@ async def handle_procedure_input_reply(
     values are always preserved unless this reply clearly supplies a
     replacement.
     """
+    if not context.confirmed:
+        async for event in _wait_for_confirmation(context):
+            yield event
+        return
     missing = _missing_required(context.procedure, context.inputs)
     logger.info("Procedure run=%s input_reply_received=true missing_before=%s",
                 context.run_id, [item.name for item in missing])
@@ -724,32 +736,32 @@ def handle_cancel(context: ProcedureContext) -> ProcedureStatus:
     for this, so (unlike `handle_procedure`/`handle_procedure_input_reply`)
     this stays a plain function, not a generator.
     """
+    context.status = "CANCELLED"
     logger.info("Procedure run=%s status=CANCELLED", context.run_id)
     return ProcedureStatus(state="cancelled", message=CANCELLED_MESSAGE, title=context.kb_title, context=None)
 
 
 def _confirmation_message(context: ProcedureContext) -> str:
-    lines = ["A matching procedure is ready:", "", context.procedure.title]
-    parameters = [f"- {item.label}: {context.inputs[item.name]}" for item in context.procedure.inputs
-                  if item.name in context.inputs]
-    if parameters:
-        lines.extend(["", "Parameters:", *parameters])
-    lines.extend(["", "Do you want me to run this procedure?"])
-    return "\n".join(lines)
+    question = ("Do you want to run this procedure for this incident?" if context.source == "incident"
+                else "Do you want to run this procedure?")
+    return (f"Procedure found: {context.procedure.title}\n\n"
+            f"Steps: {len(context.procedure.steps)}\nRisk: {context.procedure.risk}\n\n{question}")
 
 
 async def handle_procedure_confirmation(
     message: str, context: ProcedureContext, config: Config,
 ) -> AsyncIterator[ProcedureEvent | ProcedureStatus]:
-    """Only a dedicated human reply can authorize an incident's first step.
+    """Only a dedicated human reply can authorize starting a procedure.
 
     Never use extraction, incident text, KB instructions, or model inference
     to decide consent. Ambiguous replies leave the confirmation gate closed.
     """
+    if context.status != "WAITING_FOR_CONFIRMATION" or context.confirmed:
+        raise ValueError("This procedure is not waiting for confirmation.")
     reply = message.strip().casefold().rstrip(".!?")
     if reply in {"no", "do not run it", "cancel", "/cancel"}:
         cancelled = context.model_copy(update={"status": "CANCELLED"})
-        text = "Procedure execution cancelled."
+        text = CANCELLED_MESSAGE
         yield _message(text)
         yield ProcedureStatus(state="cancelled", message=text, context=cancelled)
         return
@@ -758,6 +770,6 @@ async def handle_procedure_confirmation(
         yield _message(text)
         yield ProcedureStatus(state="waiting_for_confirmation", message=text, context=context)
         return
-    confirmed = context.model_copy(update={"confirmed": True})
-    async for event in _settle(confirmed, confirmed.inputs, False, [], config):
+    confirmed = context.model_copy(update={"confirmed": True, "status": "COLLECTING_INPUTS"})
+    async for event in _collect_initial_inputs(confirmed, config):
         yield event

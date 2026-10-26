@@ -69,9 +69,9 @@ flowchart LR
 
 ## 2. Procedure mode
 
-Use `/procedure <request>` to retrieve a procedure from the ITSM knowledge base through the fixed `rag_search_kb` tool. Human-readable Markdown is parsed deterministically, parameters are extracted, and missing values are requested from the user.
+Use `/procedure <request>` to retrieve a procedure from the ITSM knowledge base through the fixed `rag_search_kb` tool. Human-readable Markdown is parsed deterministically, then a concise proposal offers **Run procedure** and **Cancel**. Explicit approval is mandatory before parameter extraction or missing-input questions, regardless of KB confirmation metadata.
 
-**The KB defines the steps and their order. The LLM decides how to execute only the current step using MCP tools.** Steps run sequentially through the Agents SDK with filtered tools and previous successful step results as context. STOP or FAILED prevents later steps. The UI shows transient progress; permanent step results and the final natural-language summary remain in chat.
+**The KB defines the steps and their order. The LLM decides how to execute only the current step using MCP tools.** After approval and input collection, steps run sequentially through the Agents SDK with filtered tools and previous successful step results as context. STOP or FAILED prevents later steps. The UI shows transient progress; permanent step results and the final natural-language summary remain in chat.
 
 ### Technical design
 
@@ -85,7 +85,9 @@ The Step Executor uses the OpenAI Agents SDK with the current step, collected in
 flowchart TD
     U["/procedure request"] --> KB["ITSM rag_search_kb"]
     KB --> P[Parse Procedure Markdown]
-    P --> IN[Extract / Collect Inputs]
+    P --> CONF[Human Confirmation Required]
+    CONF -->|Approve| IN[Extract / Collect Inputs]
+    CONF -->|Cancel| END[Stop]
     IN --> S[Current Fixed Step]
     S --> E[Step Executor]
     E --> SDK[OpenAI Agents SDK]
@@ -113,15 +115,15 @@ curl -X POST http://127.0.0.1:8000/incidents \
   }'
 ```
 
-Intake persists the incident and its own chat session, then starts background preparation without waiting for anyone to open the inbox item. The title and message feed the shared KB search, parser, and parameter extractor. Useful results persist in incident chat; missing inputs are requested there. No matching procedure leaves the incident available for manual review.
+Intake persists the incident and its own chat session, then starts background preparation without waiting for anyone to open the inbox item. The title and message feed the shared KB search and parser; parameter extraction starts only after approval. Useful results persist in incident chat; missing inputs are requested there. No matching procedure leaves the incident available for manual review.
 
-**Incident-triggered procedures always require explicit human confirmation before the first operational step, regardless of KB confirmation metadata.** Once inputs are complete, `yes`, `run it`, or `proceed` authorizes the same sequential executor used by `/procedure`; rejection cancels execution. Successful completion marks the incident DONE. While an incident waits for procedure input or confirmation, replies are routed to that incident's procedure context rather than OperationsAgent. Without an active procedure context, follow-up messages are saved without automatic processing.
+**Every procedure, including incident-triggered runs, requires explicit human approval immediately after parsing, before parameter collection or the first operational step, regardless of KB confirmation metadata.** Run procedure starts extraction from the stored request, followed by missing-input collection and the shared executor; Cancel ends the flow. Typed `yes`, `run it`, and `proceed` remain supported. Successful completion marks the incident DONE. While an incident waits for procedure input or confirmation, replies are routed to that incident's procedure context rather than OperationsAgent. Without an active procedure context, follow-up messages are saved without automatic processing.
 
 ### Technical design
 
 The pattern is **an event-driven trigger with session-scoped background processing and human-in-the-loop approval**. The FastAPI HTTP endpoint creates an incident-owned, SQLite-backed chat context. Application-managed `asyncio` tasks own its work independently of the visible conversation; processing and unread state appear in the right-side inbox while users navigate elsewhere.
 
-An incident is another source for the shared procedure engine, not another autonomous agent. Its title and message enter the same retrieval, parsing, and parameter-extraction components used by `/procedure`. Application orchestration pauses for missing inputs and mandatory human confirmation; approval resumes the exact same execution pipeline and Agents SDK Step Executor.
+An incident is another source for the shared procedure engine, not another autonomous agent. Its title and message enter the same retrieval, parsing, and parameter-extraction components used by `/procedure`. Application orchestration pauses for mandatory human confirmation first, then missing inputs; approval resumes the exact same execution pipeline and Agents SDK Step Executor.
 
 ```mermaid
 flowchart TD
@@ -130,13 +132,13 @@ flowchart TD
     INC --> BG[Background Preparation]
     BG --> KB["ITSM rag_search_kb"]
     KB --> P[Parse Matching Procedure]
-    P --> IN[Extract Parameters]
+    P --> CONF[Human Confirmation Required]
+    CONF -->|Reject| END[Stop]
+    CONF -->|Approve| IN[Extract Parameters]
     IN --> MISS{Missing inputs?}
     MISS -->|Yes| WAIT[Ask User in Incident Chat]
     WAIT --> IN
-    MISS -->|No| CONF[Human Confirmation Required]
-    CONF -->|Reject| END[Stop]
-    CONF -->|Approve| PROC[Shared Procedure Execution]
+    MISS -->|No| PROC[Shared Procedure Execution]
     PROC --> SUM[Step Results + Final Summary]
     SUM --> CHAT[Incident Chat]
 ```

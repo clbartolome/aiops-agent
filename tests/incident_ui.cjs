@@ -12,11 +12,12 @@ class Element {
   querySelectorAll(s) { return this.children.flatMap(x=>[...(s === '.context-select' && x.className?.split(' ').includes('context-select') ? [x] : []),...x.querySelectorAll(s)]); }
   scrollIntoView() {} focus() {} remove() { this.removed=true; }
 }
-const elements = Object.fromEntries(['chat','message','history','status','procedure-chip','sessions','new-session','incidents','incident-status'].map(k=>['#'+k,new Element()]));
+const elements = Object.fromEntries(['procedure-confirmation','chat','message','history','status','procedure-chip','sessions','new-session','incidents','incident-status'].map(k=>['#'+k,new Element()]));
 const incident = {id:'x', session_id:'sx', title:'High CPU <script>',message:'CPU above threshold',severity:'critical',created_at:'2026-01-01T00:00:00Z'};
 const sessions = {a:{session_id:'a',title:'A',messages:[{role:'user',content:'Normal A'}]}, b:{session_id:'b',title:'B',messages:[{role:'user',content:'Normal B'}]}, sx:{session_id:'sx',messages:[{type:'incident',incident}]}};
 const calls=[];
 let confirmDelete=true;
+let deferNextHistory=false, historyGate;
 for (const session of Object.values(sessions)) Object.assign(session,{revision:0, processing:false, unread:false});
 async function fetch(path, options) {
   calls.push(path);
@@ -29,8 +30,14 @@ async function fetch(path, options) {
     if (options?.method === 'DELETE') delete sessions[id];
     else if (action === 'read') { sessions[id].unread=false; data=sessions[id]; }
     else if (action === 'state') data=sessions[id];
-    else if (action === 'messages') {sessions[id].messages.push({role:'user',content:JSON.parse(options.body).message}); sessions[id].revision++; sessions[id].processing=id !== 'sx'; data={type:'accepted'};}
+    else if (action === 'procedure-confirmation') {sessions[id].confirmation=null; sessions[id].processing=false;sessions[id].revision++;data={type:'accepted',revision:sessions[id].revision};}
+    else if (action === 'messages') {sessions[id].messages.push({role:'user',content:JSON.parse(options.body).message}); sessions[id].revision++; sessions[id].processing=id !== 'sx'; data={type:'accepted',revision:sessions[id].revision};}
     else data=sessions[id];
+    if (!options && path === '/api/sessions/a' && deferNextHistory) {
+      deferNextHistory=false;
+      data=JSON.parse(JSON.stringify(data));
+      await historyGate.promise;
+    }
   }
   return {ok:true,json:async()=>data,headers:{get:()=> 'application/json'}};
 }
@@ -90,12 +97,55 @@ function boot() {
   assert.equal(elements['#history'].children.at(-1).innerHTML,'Finished A');
   assert.equal(sessions.a.unread,false);
   assert.equal(elements['#chat'].button.disabled,false);
+  // A history response captured before an accepted submission cannot replace
+  // the newer persisted snapshot while that submission is processing.
+  let releaseHistory;
+  historyGate={promise:new Promise(resolve=>releaseHistory=resolve)};
+  deferNextHistory=true;
+  const staleHistory=run('loadActive(activeContext,selectionVersion)');
+  await new Promise(resolve=>setImmediate(resolve));
+  elements['#message'].value='what about the deployments?';
+  await elements['#chat'].submit({preventDefault(){}});
+  assert.equal(elements['#history'].children.at(-1).textContent,'> what about the deployments?');
+  assert.equal(elements['#chat'].button.disabled,true);
+  await run('pollContexts()');
+  assert.equal(elements['#history'].children.at(-1).textContent,'> what about the deployments?');
+  releaseHistory();
+  await staleHistory;
+  assert.equal(elements['#history'].children.at(-1).textContent,'> what about the deployments?');
+  assert.equal(elements['#history'].children.filter(e=>e.textContent==='> what about the deployments?').length,1);
+  await run("selectSession('b')");
+  await run("selectSession('a')");
+  assert.equal(elements['#history'].children.at(-1).textContent,'> what about the deployments?');
+  sessions.a.processing=false;
   // A processing context's current progress is restored only in its own view.
   sessions.b.progress='Running step 2';
   await run("selectSession('b')");
   assert(elements['#history'].children.some(e=>e.className==='procedure-progress'));
   await run("selectSession('a')");
   assert(!elements['#history'].children.some(e=>e.className==='procedure-progress'));
+  // Confirmation controls survive navigation without duplicating the proposal.
+  sessions.a.messages.push({role:'assistant',content:'Procedure found: Inspect namespace'});
+  sessions.a.confirmation={run_id:'run-123'};
+  sessions.a.revision++;
+  await run("selectSession('a')");
+  const controls=elements['#procedure-confirmation'];
+  assert.equal(controls.children.length,2);
+  assert.equal(controls.children[0].textContent,'Run procedure');
+  assert.equal(controls.children[1].textContent,'Cancel');
+  await run("selectSession('b')");
+  assert.equal(controls.children.length,0);
+  await run("selectSession('a')");
+  assert.equal(controls.children.length,2);
+  assert.equal(elements['#history'].children.filter(e=>e.innerHTML==='Procedure found: Inspect namespace').length,1);
+  await controls.children[0].click();
+  assert(calls.includes('/api/sessions/a/procedure-confirmation'));
+  assert.equal(controls.children.length,0);
+  sessions.a.confirmation={run_id:'run-456'};
+  sessions.a.revision++;
+  await run("selectSession('a')");
+  await controls.children[1].click();
+  assert.equal(controls.children.length,0);
   confirmDelete=false;
   await run("deleteContext({type:'conversation',id:'a',sessionId:'a'})");
   assert(sessions.a);

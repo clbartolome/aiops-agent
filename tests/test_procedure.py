@@ -214,24 +214,15 @@ def test_successful_kb_retrieval_and_parse(config, itsm_mcp, no_extraction):
     # rag_search_kb was called exactly once; parsing never re-queries the KB.
     assert len(itsm_mcp.calls) == 1
 
-    assert status.state == "collecting_inputs"
+    assert status.state == "waiting_for_confirmation"
     assert status.title == "Inspect namespace health"
-    assert status.message == "What namespace should I use?"
-    assert message_texts(events) == [
-        "KB found: Inspect namespace health",
-        "Procedure loaded: 4 steps.",
-        "What namespace should I use?",
-    ]
-    assert progress_texts(events) == ["Searching KB", "Parsing procedure", "Extracting parameters"]
-    # Every progress event is immediately cleared before the next thing happens.
-    assert event_types(events) == [
-        "procedure_progress", "procedure_progress_clear", "procedure_message",
-        "procedure_progress", "procedure_progress_clear", "procedure_message",
-        "procedure_progress", "procedure_progress_clear", "procedure_message",
-    ]
-    assert status.context is not None
-    assert status.context.status == "COLLECTING_INPUTS"
+    assert "Procedure found: Inspect namespace health" in status.message
+    assert "Steps: 4" in status.message and "Risk: low" in status.message
+    assert message_texts(events) == ["KB found: Inspect namespace health", status.message]
+    assert progress_texts(events) == ["Searching KB", "Parsing procedure"]
+    assert status.context.status == "WAITING_FOR_CONFIRMATION"
     assert status.context.inputs == {}
+
 
 
 def test_parse_error_kb_stops_without_falling_back_to_agent(config, itsm_mcp):

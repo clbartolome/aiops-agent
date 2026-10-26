@@ -3,7 +3,7 @@ import json
 import logging
 from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
-from typing import Annotated, AsyncIterator
+from typing import Annotated, AsyncIterator, Literal
 
 from agents import MaxTurnsExceeded
 from fastapi import FastAPI, HTTPException, Header, Response
@@ -72,11 +72,11 @@ def _encode_event(event: dict) -> bytes:
 async def _persist_message(conversation: Conversation | None, role: str, content: str) -> None:
     """Store one permanent chat message under this session's own SDK-owned
     history (`app.sessions.visible_messages` reads it back on
-    `GET /api/sessions/{id}`) -- the same storage normal chat turns already
-    get for free from `Runner.run(..., session=...)` in `app.agent`. Never
-    called for transient procedure progress text, and a no-op for the
-    stateless `/api/chat` endpoint (`conversation is None`, no session to
-    persist into).
+    `GET /api/sessions/{id}`). Accepted user input is written here before
+    work starts; OperationsAgent writes its permanent output through the
+    same SDK session. Never called for transient procedure progress text,
+    and a no-op for the stateless `/api/chat` endpoint (`conversation is
+    None`, no session to persist into).
     """
     if conversation is not None:
         await conversation.session.add_items([{"role": role, "content": content}])
@@ -154,7 +154,13 @@ async def _stream_procedure(
             yield _encode_event(procedure_payload(final_status))
 
 
-async def route_message(request: ChatRequest, conversation: Conversation | None):
+async def route_message(
+    request: ChatRequest,
+    conversation: Conversation | None,
+    *,
+    input_persisted=False,
+    lock_held=False,
+):
     """Deterministic, LLM-free routing priority (a chat session has at most
     one active procedure):
       1. /cancel while a procedure is active (collecting inputs or ready)
@@ -178,37 +184,46 @@ async def route_message(request: ChatRequest, conversation: Conversation | None)
         conversation.active_procedure = None
         active = None
     procedure_route = (is_procedure_command(request.message) or (
-        active is not None and (active.status == "COLLECTING_INPUTS" or is_cancel_command(request.message))
+        active is not None and (active.status in {"COLLECTING_INPUTS", "WAITING_FOR_CONFIRMATION"} or is_cancel_command(request.message))
     ))
     logger.info("session=%s route=%s", conversation.session_id if conversation else "stateless",
                 "procedure" if procedure_route else "operations_agent")
 
     if active is not None and is_cancel_command(request.message):
-        lock_cm = conversation.lock if conversation is not None else nullcontext()
+        lock_cm = (conversation.lock if conversation is not None and not lock_held else nullcontext())
         async with lock_cm:
             status = handle_cancel(active)
             if conversation is not None:
                 conversation.active_procedure = status.context
-            await _persist_message(conversation, "user", request.message)
+            if not input_persisted:
+                await _persist_message(conversation, "user", request.message)
             await _persist_message(conversation, "assistant", status.message)
         return procedure_payload(status)
 
+    if active is not None and active.status == "WAITING_FOR_CONFIRMATION":
+        if not input_persisted:
+            await _persist_message(conversation, "user", request.message)
+        events = handle_procedure_confirmation(request.message, active, config)
+        return StreamingResponse(_stream_procedure(events, conversation), media_type="application/x-ndjson")
+
     if active is not None and active.status == "COLLECTING_INPUTS":
-        await _persist_message(conversation, "user", request.message)
+        if not input_persisted:
+            await _persist_message(conversation, "user", request.message)
         events = handle_procedure_input_reply(request.message, active, config)
         return StreamingResponse(_stream_procedure(events, conversation), media_type="application/x-ndjson")
 
     if is_procedure_command(request.message):
-        await _persist_message(conversation, "user", request.message)
+        if not input_persisted:
+            await _persist_message(conversation, "user", request.message)
         events = handle_procedure(request.message, config)
         return StreamingResponse(_stream_procedure(events, conversation), media_type="application/x-ndjson")
 
     session = conversation.session if conversation is not None else None
-    lock_cm = conversation.lock if conversation is not None else nullcontext()
+    lock_cm = (conversation.lock if conversation is not None and not lock_held else nullcontext())
     try:
         async with lock_cm:
             response = (await run_agent(request.message, config) if session is None
-                        else await run_agent(request.message, config, session=session))
+                        else await run_agent(request.message, config, session=session, input_persisted=input_persisted))
     except MCPConnectionError as error:
         # This application exception contains only server names and error categories.
         raise HTTPException(502, str(error)) from None
@@ -269,21 +284,34 @@ async def get_session(session_id: str):
 async def session_message(session_id: str, request: ChatRequest, response: Response,
                           prefer: Annotated[str | None, Header()] = None):
     conversation = get_conversation(session_id)
-    if conversation.processing or conversation.deleting:
+    if conversation.processing:
         raise HTTPException(409, "This session is busy.")
-    # Active incident workflows always use the session task, including API
-    # callers without Prefer, so repeated confirmations cannot race a stream.
-    if prefer == "respond-async" or (conversation.kind == "incident" and conversation.active_procedure is not None):
-        start_session_work(conversation, request)
-        response.status_code = 202
-        return {"session_id": session_id, **work_state(conversation)}
+    # Commit the triggering message before scheduling any long-running work.
+    # The lock serializes acceptance and protects against concurrent deletion.
+    async with conversation.lock:
+        if conversation.processing or conversation.deleting:
+            raise HTTPException(409, "This session is busy.")
+        await _persist_message(conversation, "user", request.message)
+        if conversation.kind == "chat" and conversation.title == "New conversation":
+            conversation.title = " ".join(request.message.split())[:60]
+        conversation.updated_at = timestamp()
+        session_store.save(conversation)
+        if prefer == "respond-async" or (conversation.active_procedure is not None and (
+                conversation.kind == "incident" or conversation.active_procedure.status == "WAITING_FOR_CONFIRMATION")):
+            start_session_work(conversation, request, input_persisted=True)
+            response.status_code = 202
+            return {"session_id": session_id, **work_state(conversation)}
+        if conversation.kind == "chat":
+            # Legacy request-owned calls remain serialized across both the
+            # durable input write and the agent run. Async UI calls return
+            # above and release this lock after scheduling session work.
+            return await route_message(
+                request, conversation, input_persisted=True, lock_held=True,
+            )
     if conversation.kind == "incident":
-        return await route_incident_message(request, conversation)
-    if conversation.title == "New conversation":
-        conversation.title = " ".join(request.message.split())[:60]
-    conversation.updated_at = timestamp()
-    session_store.save(conversation)
-    return await route_message(request, conversation)
+        return await route_incident_message(request, conversation, input_persisted=True)
+    raise HTTPException(500, "Unsupported session kind.")
+
 
 
 incident_store = IncidentStore()
@@ -351,7 +379,9 @@ def work_state(conversation):
     active = conversation.active_procedure
     return {"processing": conversation.processing, "progress": conversation.progress,
             "unread": bool(conversation.unread), "revision": conversation.revision,
-            "awaiting_input": active is not None and active.status == "COLLECTING_INPUTS"}
+            "awaiting_input": active is not None and active.status == "COLLECTING_INPUTS",
+            "confirmation": {"run_id": active.run_id} if active is not None
+            and active.status == "WAITING_FOR_CONFIRMATION" else None}
 
 
 def message_changed(conversation):
@@ -361,7 +391,7 @@ def message_changed(conversation):
     session_store.save(conversation)
 
 
-def start_session_work(conversation, request=None, *, work=None):
+def start_session_work(conversation, request=None, *, work=None, input_persisted=False):
     """Capture the owner, never a browser selection. Optional work is the
     integration seam used by incident preparation. Incident execution MUST
     require human confirmation before its first operational step.
@@ -371,7 +401,7 @@ def start_session_work(conversation, request=None, *, work=None):
     conversation.processing = True
     conversation.progress = "Working"
     conversation.revision += 1
-    task = asyncio.create_task(run_session_work(conversation, request, work=work))
+    task = asyncio.create_task(run_session_work(conversation, request, work=work, input_persisted=input_persisted))
     session_tasks[conversation.session_id] = task
     def forget(finished):
         if session_tasks.get(conversation.session_id) is finished:
@@ -380,18 +410,18 @@ def start_session_work(conversation, request=None, *, work=None):
     return task
 
 
-async def run_session_work(conversation, request, *, work=None):
+async def run_session_work(conversation, request, *, work=None, input_persisted=False):
     try:
         if work is not None:
             await work(conversation)
         else:
             if conversation.kind == "incident":
-                result = await route_incident_message(request, conversation)
+                result = await route_incident_message(request, conversation, input_persisted=input_persisted)
             else:
                 if conversation.title == "New conversation":
                     conversation.title = " ".join(request.message.split())[:60]
                 session_store.save(conversation)
-                result = await route_message(request, conversation)
+                result = await route_message(request, conversation, input_persisted=input_persisted)
             if isinstance(result, StreamingResponse):
                 # Drain server-side; browser lifetime never owns this iterator.
                 async for _ in result.body_iterator:
@@ -491,15 +521,22 @@ def start_incident_preparation(incident):
     start_session_work(get_conversation(incident.session_id), work=prepare)
 
 
-async def route_incident_message(request, conversation):
+async def route_incident_message(request, conversation, *, input_persisted=False):
     # Never route incident input through OperationsAgent or infer consent from
     # event text. Only this human message endpoint can resume confirmation.
-    await _persist_message(conversation, "user", request.message)
+    if not input_persisted:
+        await _persist_message(conversation, "user", request.message)
     active = conversation.active_procedure
     if active is None:
         return {"type": "message_saved"}
     config = load_config()
-    if active.status == "WAITING_FOR_CONFIRMATION" or request.message.strip().casefold() in {"cancel", "/cancel"}:
+    if active.status != "WAITING_FOR_CONFIRMATION" and request.message.strip().casefold() in {"cancel", "/cancel"}:
+        status = handle_cancel(active)
+        conversation.active_procedure = None
+        record_incident_outcome(conversation, status)
+        await _persist_message(conversation, "assistant", status.message)
+        return procedure_payload(status)
+    if active.status == "WAITING_FOR_CONFIRMATION":
         events = handle_procedure_confirmation(request.message, active, config)
     elif active.status == "COLLECTING_INPUTS":
         events = handle_procedure_input_reply(request.message, active, config)
@@ -509,3 +546,24 @@ async def route_incident_message(request, conversation):
     if incident:
         incident_store.update_workflow(incident.id, "IN_PROGRESS", active.run_id)
     return StreamingResponse(_stream_procedure(events, conversation), media_type="application/x-ndjson")
+
+
+class ConfirmationRequest(BaseModel):
+    run_id: str
+    action: Literal["approve", "cancel"]
+
+
+@app.post("/api/sessions/{session_id}/procedure-confirmation", status_code=202)
+async def confirm_procedure(session_id: str, request: ConfirmationRequest):
+    conversation = get_conversation(session_id)
+    if conversation.processing:
+        raise HTTPException(409, "This session is busy.")
+    async with conversation.lock:
+        active = conversation.active_procedure
+        if (conversation.processing or conversation.deleting or active is None or active.run_id != request.run_id
+                or active.status != "WAITING_FOR_CONFIRMATION" or active.confirmed):
+            raise HTTPException(409, "This procedure is no longer waiting for confirmation.")
+        message = ChatRequest(message="yes" if request.action == "approve" else "cancel")
+        await _persist_message(conversation, "user", message.message)
+        start_session_work(conversation, message, input_persisted=True)
+        return {"session_id": session_id, **work_state(conversation)}

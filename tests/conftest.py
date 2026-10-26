@@ -154,3 +154,13 @@ def durable_sessions(tmp_path, monkeypatch):
     for conversation in web.conversations.values():
         if hasattr(conversation.session, 'close'):
             conversation.session.close()
+
+
+async def prepare_and_approve(message, config):
+    """Input/execution regressions explicitly approve before testing that phase."""
+    from app.procedure import handle_procedure, handle_procedure_confirmation
+    events, status = await drain_procedure_events(handle_procedure(message, config))
+    if status.state == 'waiting_for_confirmation':
+        continued, status = await drain_procedure_events(handle_procedure_confirmation('yes', status.context, config))
+        events += continued
+    return events, status

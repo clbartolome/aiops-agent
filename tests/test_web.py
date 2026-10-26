@@ -366,6 +366,7 @@ def make_procedure_context(status="COLLECTING_INPUTS", inputs=None):
         inputs=[], steps=[{"id": "step-1", "title": "Step 1", "instruction": "Do it."}],
     )
     return ProcedureContext(
+        confirmed=True,
         run_id="run-1", original_request="inspect namespace health", kb_title="Inspect namespace health",
         kb_content="# Inspect namespace health\n", procedure=procedure, inputs=inputs or {}, status=status,
     )
@@ -606,6 +607,7 @@ Done.
     # declares no required inputs, so that function settles straight to
     # READY/RUNNING internally regardless of this stored status.
     context = ProcedureContext(
+        confirmed=True,
         run_id="run-1", original_request="", kb_title=procedure.title, kb_content=single_step_kb,
         procedure=procedure, inputs={}, status="COLLECTING_INPUTS",
     )
@@ -723,7 +725,7 @@ def test_terminal_procedure_clears_association_and_returns_to_chat(
     assert conversation.active_procedure is None
     response = request('POST', path, json={'message': 'hello'})
     assert response.json() == {'response': agent.return_value}
-    agent.assert_awaited_once_with('hello', config, session=conversation.session)
+    agent.assert_awaited_once_with('hello', config, session=conversation.session, input_persisted=True)
     procedure_lifecycle.reply.assert_not_called()
     assert f'session={conversation.session_id} route=procedure' in caplog.text
     assert f'session={conversation.session_id} route=operations_agent' in caplog.text
@@ -742,7 +744,7 @@ def test_waiting_procedure_in_another_session_does_not_intercept_chat(
     web.conversations[second.session_id] = second
     response = request('POST', f'/api/sessions/{second.session_id}/messages', json={'message': message})
     assert response.json() == {'response': agent.return_value}
-    agent.assert_awaited_once_with(message, config, session=second.session)
+    agent.assert_awaited_once_with(message, config, session=second.session, input_persisted=True)
     procedure_lifecycle.start.assert_not_called()
     procedure_lifecycle.reply.assert_not_called()
     assert first.active_procedure.status == 'COLLECTING_INPUTS'

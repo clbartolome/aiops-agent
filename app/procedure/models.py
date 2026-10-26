@@ -146,7 +146,7 @@ class ProcedureContext(BaseModel):
     plus anything deterministically validated from extraction).
 
     `status` tracks progress: input collection (`COLLECTING_INPUTS`,
-    `WAITING_FOR_CONFIRMATION` for incident-originated runs, `READY`), step execution (`RUNNING`, set just before the first step
+    `WAITING_FOR_CONFIRMATION` for every run, `READY`), step execution (`RUNNING`, set just before the first step
     starts), a terminal outcome (`COMPLETED` once every step has
     succeeded, `STOPPED`, `FAILED`), or `CANCELLED`. Steps run one at a
     time, in fixed KB order, continuing only on SUCCESS; `current_step_index`
@@ -159,7 +159,7 @@ class ProcedureContext(BaseModel):
 
     source: Literal["user", "incident"] = "user"
     source_id: str | None = None
-    # External events never authorize automation, even when KB metadata does.
+    # Application-level approval is mandatory before collection or execution.
     confirmed: bool = False
     run_id: str
     original_request: str

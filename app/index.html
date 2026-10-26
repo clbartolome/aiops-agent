@@ -57,6 +57,10 @@
     button:focus-visible { outline: 2px solid #8cd8b1; }
     button:disabled { cursor: wait; opacity: .5; }
     #status { min-height: 24px; }
+    #procedure-confirmation { display: flex; gap: 10px; margin-bottom: 16px; }
+    #procedure-confirmation:empty { display: none; }
+    .confirm-run { color: #101214; background: #8cd8b1; border-color: #8cd8b1; }
+    .confirm-cancel:hover { color: #ffb1a8; border-color: #ffb1a8; }
 
     .incidents-panel { border-right: 0; border-left: 1px solid #353a40; padding: 0 0 0 16px; font-size: 13px; }
     .severity-critical { --incident-accent: #ef8f8f; }
@@ -104,6 +108,7 @@
       <p class="hint">Enter to send · Conversation context is retained</p>
     </header>
     <section id="history" role="log" aria-label="Conversation" aria-live="polite"></section>
+    <div id="procedure-confirmation" aria-label="Procedure confirmation"></div>
     <form id="chat">
       <label for="message" aria-label="Your message">&gt;</label>
       <span id="procedure-chip" class="procedure-chip" hidden>PROCEDURE</span>
@@ -121,6 +126,7 @@
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
   <script>
+    const confirmationControls = document.querySelector('#procedure-confirmation');
     const form = document.querySelector('#chat');
     const input = document.querySelector('#message');
     const button = form.querySelector('button');
@@ -134,6 +140,8 @@
     const sessionStates = new Map();
     let selectionVersion = 0;
     let loadedRevision = null;
+    let historyRequestVersion = 0;
+    let minimumHistoryRevision = 0;
     let loadingContext = false;
 
     // Deterministic /procedure routing mirrors the backend: only the literal
@@ -186,7 +194,27 @@
       form.hidden = !activeContext;
       button.disabled = loadingContext || !!sessionStates.get(activeContext?.sessionId)?.processing;
       input.disabled = button.disabled;
+      renderConfirmation();
     }
+    function renderConfirmation() {
+      confirmationControls.replaceChildren();
+      const owner = activeContext;
+      const state = sessionStates.get(owner?.sessionId);
+      if (!owner || loadingContext || state?.processing || !state?.confirmation) return;
+      const runId = state.confirmation.run_id;
+      for (const [action, label, className] of [
+        ['approve', 'Run procedure', 'confirm-run'], ['cancel', 'Cancel', 'confirm-cancel'],
+      ]) {
+        const control = document.createElement('button');
+        control.type = 'button';
+        control.className = className;
+        control.textContent = label;
+        control.addEventListener('click', () => sendSessionRequest(owner,
+          `/api/sessions/${owner.sessionId}/procedure-confirmation`, {run_id: runId, action}));
+        confirmationControls.append(control);
+      }
+    }
+
     // State precedence: processing always wins; selected items suppress unread.
     function indicator(state, selected) {
       const slot = document.createElement('span');
@@ -222,7 +250,7 @@
       if (!window.confirm(`Delete this ${kind}?`)) return;
       try {
         const path = context.type === 'incident' ? `/api/incidents/${context.id}` : `/api/sessions/${context.sessionId}`;
-        await api(path, {method: 'DELETE'});
+        const accepted = await api(path, {method: 'DELETE'});
         sessionStates.delete(context.sessionId);
         const wasSelected = activeContext?.sessionId === context.sessionId;
         if (wasSelected) {
@@ -286,8 +314,12 @@
     }
 
     async function loadActive(context, version) {
+      const requestVersion = ++historyRequestVersion;
       const session = await api(`/api/sessions/${context.sessionId}`);
-      if (version !== selectionVersion || activeContext?.sessionId !== context.sessionId) return;
+      if (version !== selectionVersion || activeContext?.sessionId !== context.sessionId
+          || requestVersion !== historyRequestVersion
+          || session.revision < minimumHistoryRevision
+          || (loadedRevision !== null && session.revision < loadedRevision)) return;
       rememberState(context.sessionId, session);
       procedureProgress.hide();
       history.replaceChildren();
@@ -311,6 +343,8 @@
       procedureAwaitingInput = false;
       history.replaceChildren();
       loadedRevision = null;
+      minimumHistoryRevision = 0;
+      ++historyRequestVersion;
       input.value = '';
       exitProcedureMode();
       loadingContext = true;
@@ -560,23 +594,26 @@
       if (buffer.trim()) handleProcedureEvent(JSON.parse(buffer));
     }
 
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const message = (procedureMode ? `/procedure ${input.value}` : input.value).trim();
-      const owner = activeContext;
-      if (!message || !owner || loadingContext || sessionStates.get(owner.sessionId)?.processing) return;
+    async function sendSessionRequest(owner, path, payload) {
+      if (!owner || activeContext?.sessionId !== owner.sessionId || loadingContext
+          || sessionStates.get(owner.sessionId)?.processing) return;
       const version = selectionVersion;
+      ++historyRequestVersion;
       rememberState(owner.sessionId, {processing: true});
       updateComposer();
       input.value = '';
       exitProcedureMode();
       try {
-        await api(`/api/sessions/${owner.sessionId}/messages`, {
+        const accepted = await api(path, {
           method: 'POST',
           headers: {'Content-Type': 'application/json', 'Prefer': 'respond-async'},
-          body: JSON.stringify({message}),
+          body: JSON.stringify(payload),
         });
-        if (version === selectionVersion) await loadActive(owner, version);
+        if (version === selectionVersion) {
+          minimumHistoryRevision = Math.max(minimumHistoryRevision, accepted.revision);
+          ++historyRequestVersion;
+          await loadActive(owner, version);
+        }
         await refreshSessions();
         await refreshIncidents();
       } catch (error) {
@@ -585,6 +622,14 @@
       } finally {
         if (version === selectionVersion) updateComposer();
       }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = (procedureMode ? `/procedure ${input.value}` : input.value).trim();
+      const owner = activeContext;
+      if (!message || !owner) return;
+      await sendSessionRequest(owner, `/api/sessions/${owner.sessionId}/messages`, {message});
     });
 
     async function pollContexts() {

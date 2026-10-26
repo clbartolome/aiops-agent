@@ -76,21 +76,19 @@ def test_automatic_shared_preparation_and_mandatory_confirmation(integration):
             id = incident['session_id']
             # No GET/open was needed to start or complete preparation.
             assert rag.calls == [('rag_search_kb', {'query':PAYLOAD['title']+'\n\n'+PAYLOAD['message']})]
-            assert extractor.await_args.args[0] == PAYLOAD['title']+'\n\n'+PAYLOAD['message']
+            extractor.assert_not_awaited()
             context = web.get_conversation(id).active_procedure
             assert context.source == 'incident' and context.source_id == incident['id']
-            assert context.inputs == VALUES
+            assert context.inputs == {}
             assert context.status == 'WAITING_FOR_CONFIRMATION' and not context.confirmed
             assert not context.procedure.confirmation_required
             assert web.incident_store.get(incident['id']).procedure_run_id == context.run_id
             stored = await messages(c, id)
             texts = '\n'.join(m.get('content','') for m in stored)
             assert 'KB found: Investigate high CPU' in texts
-            assert 'Incident parameters identified:' in texts
-            for label, value in [('Host','web-server-prod'), ('Node','worker-03'), ('Threshold','95')]:
-                assert f'- {label}: {value}' in texts
+            assert 'Incident parameters identified:' not in texts
             assert 'undeclared_secret' not in texts
-            assert 'Do you want me to run this procedure?' in texts
+            assert 'Do you want to run this procedure for this incident?' in texts
             assert not any(m.get('type') == 'procedure_progress' for m in stored)
             assert await messages(c, normal) == []
             state = (await c.get(f'/api/sessions/{id}/state')).json()
@@ -131,32 +129,32 @@ def test_rejection_does_not_execute(integration, rejection):
             response = await c.post('/api/sessions/' + incident['session_id'] + '/messages', json={'message':rejection})
             assert response.status_code == 202
             await settle(incident['session_id'])
-            assert (await messages(c,incident['session_id']))[-1]['content'] == 'Procedure execution cancelled.'
+            assert (await messages(c,incident['session_id']))[-1]['content'] == 'Procedure cancelled.'
             assert web.get_conversation(incident['session_id']).active_procedure is None
             assert web.incident_store.get(incident['id']).status == 'NEW'
             executor.assert_not_awaited()
     asyncio.run(scenario())
 
 
-def test_missing_input_reply_returns_to_confirmation(integration):
+def test_approval_then_missing_input_reply_executes(integration):
     rag, extractor, executor, agent = integration
     extractor.return_value = {key:value for key,value in VALUES.items() if key != 'namespace'}
     async def scenario():
         async with client() as c:
             incident = await post_incident(c)
             id = incident['session_id']
+            assert web.get_conversation(id).active_procedure.status == 'WAITING_FOR_CONFIRMATION'
+            extractor.assert_not_awaited()
+            await reply(c,id,'maybe later')
+            extractor.assert_not_awaited()
+            await reply(c,id,'yes')
             assert web.get_conversation(id).active_procedure.status == 'COLLECTING_INPUTS'
             assert 'namespace' in (await messages(c,id))[-1]['content']
-            assert not web.get_conversation(id).processing
+            executor.assert_not_awaited()
             await reply(c,id,'namespace is production')
-            context = web.get_conversation(id).active_procedure
-            assert context.status == 'WAITING_FOR_CONFIRMATION'
-            assert context.inputs == VALUES
-            executor.assert_not_awaited()
+            assert web.get_conversation(id).active_procedure is None
+            assert executor.await_args.args[3] == VALUES
             assert len(rag.calls) == 1
-            await reply(c,id,'maybe later')
-            assert web.get_conversation(id).active_procedure.status == 'WAITING_FOR_CONFIRMATION'
-            executor.assert_not_awaited()
             agent.assert_not_awaited()
     asyncio.run(scenario())
 
