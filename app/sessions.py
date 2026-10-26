@@ -6,6 +6,8 @@ from uuid import uuid4
 
 from agents import SQLiteSession
 
+from app.procedure.models import ProcedureContext
+
 
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -19,6 +21,10 @@ class Conversation:
     updated_at: str = field(default_factory=timestamp)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session: SQLiteSession = field(init=False)
+    # At most one active /procedure run per chat session (see `app.procedure`
+    # and `app.web`'s deterministic routing priority). `None` means no
+    # procedure is currently waiting on, or ready to use, this session.
+    active_procedure: ProcedureContext | None = None
 
     def __post_init__(self):
         self.session = SQLiteSession(self.session_id)
