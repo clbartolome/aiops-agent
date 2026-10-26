@@ -432,6 +432,8 @@ async def _execute_steps(
     past a step once it has returned SUCCESS, so on STOP/FAILED it is left
     pointing at the step that stopped/failed the procedure.
     """
+    if context.source == "incident" and not context.confirmed:
+        raise ValueError("Incident execution requires explicit human confirmation.")
     procedure = context.procedure
     logger.info("Procedure run=%s status=RUNNING steps=%d", context.run_id, len(procedure.steps))
     current_context = context.model_copy(update={"status": "RUNNING", "current_step_index": 0})
@@ -513,6 +515,16 @@ async def _settle(context: ProcedureContext, collected: dict[str, PrimitiveValue
         yield ProcedureStatus(state="collecting_inputs", message=message, title=context.kb_title, context=new_context)
         return
 
+    # This gate is shared by initial preparation AND missing-input replies.
+    # KB confirmation metadata cannot override incident provenance.
+    if context.source == "incident" and not context.confirmed:
+        waiting = context.model_copy(update={"inputs": collected, "status": "WAITING_FOR_CONFIRMATION"})
+        message = _confirmation_message(waiting)
+        yield _message(message)
+        yield ProcedureStatus(state="waiting_for_confirmation", message=message,
+                              title=context.kb_title, context=waiting)
+        return
+
     logger.info("Procedure run=%s status=READY", context.run_id)
     ready_context = context.model_copy(update={"inputs": collected, "status": "READY"})
     yield _message(_ready_message(procedure, collected))
@@ -573,6 +585,18 @@ async def handle_procedure(message: str, config: Config) -> AsyncIterator[Proced
         yield ProcedureStatus(state="empty_query", message=EMPTY_QUERY_MESSAGE)
         return
 
+    async for event in prepare_procedure(query, config):
+        yield event
+
+
+async def prepare_procedure(
+    request_text: str, config: Config, *, source: str = "user", source_id: str | None = None,
+) -> AsyncIterator[ProcedureEvent | ProcedureStatus]:
+    """One retrieval/parser/extractor entry point for user and incident requests."""
+    query = request_text.strip()
+    message = request_text
+    no_result = ("No matching procedure was found for this incident."
+                 if source == "incident" else NO_RESULT_MESSAGE)
     yield _progress(SEARCHING_KB_STAGE)
     try:
         kb = await _call_rag_search_kb(query, config)
@@ -587,13 +611,15 @@ async def handle_procedure(message: str, config: Config) -> AsyncIterator[Proced
     request = ProcedureRequest(original_message=message, query=query, kb=kb)
 
     if request.kb is None:
-        yield _message(NO_RESULT_MESSAGE)
-        yield ProcedureStatus(state="no_result", message=NO_RESULT_MESSAGE)
+        yield _message(no_result)
+        yield ProcedureStatus(state="no_result", message=no_result)
         return
 
     yield _message(f"KB found: {request.kb.title}")
 
     if not is_executable_procedure(request.kb.content):
+        if source == "incident":
+            yield _message(no_result)
         yield ProcedureStatus(state="not_executable", message=NOT_EXECUTABLE_MESSAGE, title=request.kb.title)
         return
 
@@ -617,9 +643,16 @@ async def handle_procedure(message: str, config: Config) -> AsyncIterator[Proced
         yield _PROGRESS_CLEAR
 
     context = ProcedureContext(
+        source=source, source_id=source_id,
         run_id=run_id, original_request=query, kb_title=request.kb.title, kb_content=request.kb.content,
         procedure=procedure, inputs=collected, status="COLLECTING_INPUTS",
     )
+    if source == "incident":
+        identified = {name: value for name, value in collected.items() if name not in _apply_defaults(procedure)}
+        if identified:
+            lines = ["Incident parameters identified:", ""]
+            lines.extend(f"- {item.label}: {identified[item.name]}" for item in procedure.inputs if item.name in identified)
+            yield _message("\n".join(lines))
     collector = _Collector()
     async for event in collector.forward(_settle(context, collected, extraction_failed, remaining, config)):
         yield event
@@ -693,3 +726,38 @@ def handle_cancel(context: ProcedureContext) -> ProcedureStatus:
     """
     logger.info("Procedure run=%s status=CANCELLED", context.run_id)
     return ProcedureStatus(state="cancelled", message=CANCELLED_MESSAGE, title=context.kb_title, context=None)
+
+
+def _confirmation_message(context: ProcedureContext) -> str:
+    lines = ["A matching procedure is ready:", "", context.procedure.title]
+    parameters = [f"- {item.label}: {context.inputs[item.name]}" for item in context.procedure.inputs
+                  if item.name in context.inputs]
+    if parameters:
+        lines.extend(["", "Parameters:", *parameters])
+    lines.extend(["", "Do you want me to run this procedure?"])
+    return "\n".join(lines)
+
+
+async def handle_procedure_confirmation(
+    message: str, context: ProcedureContext, config: Config,
+) -> AsyncIterator[ProcedureEvent | ProcedureStatus]:
+    """Only a dedicated human reply can authorize an incident's first step.
+
+    Never use extraction, incident text, KB instructions, or model inference
+    to decide consent. Ambiguous replies leave the confirmation gate closed.
+    """
+    reply = message.strip().casefold().rstrip(".!?")
+    if reply in {"no", "do not run it", "cancel", "/cancel"}:
+        cancelled = context.model_copy(update={"status": "CANCELLED"})
+        text = "Procedure execution cancelled."
+        yield _message(text)
+        yield ProcedureStatus(state="cancelled", message=text, context=cancelled)
+        return
+    if reply not in {"yes", "run it", "proceed"}:
+        text = "Please confirm with yes, run it, or proceed; or cancel."
+        yield _message(text)
+        yield ProcedureStatus(state="waiting_for_confirmation", message=text, context=context)
+        return
+    confirmed = context.model_copy(update={"confirmed": True})
+    async for event in _settle(confirmed, confirmed.inputs, False, [], config):
+        yield event

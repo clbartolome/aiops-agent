@@ -146,7 +146,7 @@ class ProcedureContext(BaseModel):
     plus anything deterministically validated from extraction).
 
     `status` tracks progress: input collection (`COLLECTING_INPUTS`,
-    `READY`), step execution (`RUNNING`, set just before the first step
+    `WAITING_FOR_CONFIRMATION` for incident-originated runs, `READY`), step execution (`RUNNING`, set just before the first step
     starts), a terminal outcome (`COMPLETED` once every step has
     succeeded, `STOPPED`, `FAILED`), or `CANCELLED`. Steps run one at a
     time, in fixed KB order, continuing only on SUCCESS; `current_step_index`
@@ -157,6 +157,10 @@ class ProcedureContext(BaseModel):
     stored result.
     """
 
+    source: Literal["user", "incident"] = "user"
+    source_id: str | None = None
+    # External events never authorize automation, even when KB metadata does.
+    confirmed: bool = False
     run_id: str
     original_request: str
     kb_title: str
@@ -164,7 +168,7 @@ class ProcedureContext(BaseModel):
     procedure: ProcedureDefinition
     inputs: dict[str, PrimitiveValue] = {}
     status: Literal[
-        "COLLECTING_INPUTS", "READY", "RUNNING", "COMPLETED", "STOPPED", "FAILED", "CANCELLED",
+        "COLLECTING_INPUTS", "WAITING_FOR_CONFIRMATION", "READY", "RUNNING", "COMPLETED", "STOPPED", "FAILED", "CANCELLED",
     ] = "COLLECTING_INPUTS"
     step_results: dict[str, StepResult] = {}
     current_step_index: int = 0

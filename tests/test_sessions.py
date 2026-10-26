@@ -29,7 +29,9 @@ def test_creation_listing_and_unknown_session():
             a, b = first.json(), second.json()
             assert UUID(a['session_id']) != UUID(b['session_id'])
             assert set(a) == {'session_id', 'title', 'created_at', 'updated_at'}
-            assert (await client.get('/api/sessions')).json() == [a, b]
+            listed = (await client.get('/api/sessions')).json()
+            assert [{key: item[key] for key in a} for item in listed] == [a, b]
+            assert all(not item['processing'] and not item['unread'] for item in listed)
             assert (await client.get('/api/sessions/' + a['session_id'])).json()['messages'] == []
             assert (await client.post('/api/sessions/missing/messages', json={'message': 'hello'})).status_code == 404
             assert (await client.get('/api/sessions/missing')).status_code == 404

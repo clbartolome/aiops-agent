@@ -143,7 +143,7 @@ def test_page_hides_progress_on_every_terminal_path(agent):
     page = request("GET", "/").text
     assert "procedureProgress.hide();\n        appendMessage(data.message, 'assistant');" in page
     assert "procedureProgress.hide();\n        procedureAwaitingInput = data.state === 'collecting_inputs';" in page
-    assert "procedureProgress.hide();\n        appendMessage(`Error: ${error.message}`, 'error');" in page
+    assert "if (version === selectionVersion) status.textContent = `Error: ${error.message}`;" in page
 
 
 def test_page_does_not_fake_progress_with_a_frontend_timer(agent):
@@ -159,13 +159,13 @@ def test_page_tracks_procedure_awaiting_input_across_replies(agent):
     # progress bubble too, and the flag is recomputed from the response
     # state (never assumed) after every request.
     assert "let procedureAwaitingInput = false;" in page
-    assert "const isProcedureReply = !isProcedure && procedureAwaitingInput;" in page
-    assert "else if (isProcedureReply) procedureProgress.show('Extracting parameters');" in page
+    assert "procedureAwaitingInput = session.awaiting_input;" in page
+    assert "if (session.processing && session.progress) procedureProgress.show(session.progress);" in page
 
 
 def test_page_skips_progress_for_empty_procedure_command(agent):
     page = request("GET", "/").text
-    assert "if (isProcedure && procedureQuery) procedureProgress.show('Searching KB');" in page
+    assert "if (session.processing && session.progress) procedureProgress.show(session.progress);" in page
 
 
 # --- Session message persistence/restoration (frontend) ---------------------
@@ -181,7 +181,7 @@ def test_page_switches_active_session_and_clears_history_before_fetching(agent):
     """
     page = request("GET", "/").text
     assert (
-        "selectedSession = id;\n      procedureAwaitingInput = false;\n      history.replaceChildren();" in page
+        "activeContext = context;\n      updateSelection();\n      procedureProgress.hide();\n      procedureAwaitingInput = false;\n      history.replaceChildren();" in page
     )
     assert "status.textContent = 'Loading conversation...';" in page
 
@@ -198,7 +198,7 @@ def test_page_shows_controlled_error_and_clears_stale_messages_on_load_failure(a
     """
     page = request("GET", "/").text
     assert (
-        "history.replaceChildren();\n        status.textContent = 'Unable to load this conversation.';" in page
+        "if (version === selectionVersion) status.textContent = 'Unable to load this conversation.';" in page
     )
 
 

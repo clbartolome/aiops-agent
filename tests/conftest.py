@@ -142,3 +142,15 @@ def mcp_boundary(monkeypatch):
     yield boundary
     assert all(server.session is None for server in boundary.servers)
     assert sorted(boundary.closed) == sorted(server.name for server in boundary.servers)
+
+
+@pytest.fixture(autouse=True)
+def durable_sessions(tmp_path, monkeypatch):
+    from app import web
+    from app.sessions import SessionStore
+    monkeypatch.setattr(web, 'session_store', SessionStore(tmp_path / 'sessions.sqlite3'))
+    monkeypatch.setattr(web, 'conversations', {})
+    yield
+    for conversation in web.conversations.values():
+        if hasattr(conversation.session, 'close'):
+            conversation.session.close()
