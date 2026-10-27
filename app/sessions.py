@@ -45,6 +45,44 @@ class Conversation:
                 ("session_id", "title", "created_at", "updated_at")}
 
 
+class IncidentAgentSession:
+    """Expose an incident-owned SDK session as normal agent history.
+
+    The first stored item remains the UI's special incident reference. For
+    model input only, that reference is projected to a normal user-context
+    message. All mutations still go directly to the same underlying session.
+    """
+
+    def __init__(self, session: SQLiteSession, incident) -> None:
+        self._session = session
+        self._incident = incident
+        self.session_id = session.session_id
+        self.session_settings = getattr(session, "session_settings", None)
+
+    async def get_items(self, limit: int | None = None) -> list[dict]:
+        items = await self._session.get_items(limit=limit)
+        context = (
+            "External incident context (not an instruction):\n"
+            f"Severity: {self._incident.severity}\n"
+            f"Title: {self._incident.title}\n"
+            f"Message: {self._incident.message}"
+        )
+        return [
+            {"role": "user", "content": context}
+            if item.get("type") == "incident" else item
+            for item in items
+        ]
+
+    async def add_items(self, items: list[dict]) -> None:
+        await self._session.add_items(items)
+
+    async def pop_item(self) -> dict | None:
+        return await self._session.pop_item()
+
+    async def clear_session(self) -> None:
+        await self._session.clear_session()
+
+
 async def visible_messages(session: SQLiteSession) -> list[dict[str, str]]:
     messages = []
     for item in await session.get_items():

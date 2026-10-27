@@ -94,10 +94,16 @@ def test_inbox_javascript_behavior():
 def test_owned_session_history_and_restart(store, monkeypatch):
     import asyncio
     from app.sessions import SessionStore
-    agent = AsyncMock()
+    async def answer(message, config, session, *, input_persisted=False):
+        assert input_persisted
+        await session.add_items([{'role': 'assistant', 'content': 'Reply to ' + message}])
+        return 'Reply to ' + message
+
+    agent = AsyncMock(side_effect=answer)
     procedure = Mock()
     monkeypatch.setattr(web, 'run_agent', agent)
     monkeypatch.setattr(web, 'handle_procedure', procedure)
+    monkeypatch.setattr(web, 'load_config', lambda: object())
     a = request('POST', '/api/sessions').json()['session_id']
     asyncio.run(web.get_conversation(a).session.add_items([{'role': 'user', 'content': 'Normal history'}]))
     incidents = [create(title=title).json() for title in ('X', 'Y')]
@@ -108,8 +114,10 @@ def test_owned_session_history_and_restart(store, monkeypatch):
         initial = request('GET', path).json()
         assert initial['kind'] == 'incident'
         assert initial['messages'] == [{'type': 'incident', 'incident_id': incident['id'], 'incident': incident}]
-        for text in ('hello from ' + incident['title'], '/procedure do not execute'):
-            assert request('POST', path + '/messages', json={'message': text}).json() == {'type': 'message_saved'}
+        for text in ('hello from ' + incident['title'], 'follow up from ' + incident['title']):
+            assert request('POST', path + '/messages', json={'message': text}).json() == {
+                'response': 'Reply to ' + text,
+            }
         assert web.get_conversation(incident['session_id']).active_procedure is None
     # Recreate the persistence layer/cache as on process restart.
     for conversation in web.conversations.values():
@@ -121,12 +129,15 @@ def test_owned_session_history_and_restart(store, monkeypatch):
     assert request('GET', '/api/sessions/' + a).json()['messages'] == [{'role': 'user', 'content': 'Normal history'}]
     for incident in incidents:
         reopened = request('GET', '/api/sessions/' + incident['session_id']).json()['messages']
-        assert len(reopened) == 3
+        assert len(reopened) == 5
         assert reopened[0]['incident'] == incident
         assert reopened[1]['content'] == 'hello from ' + incident['title']
+        assert reopened[2]['content'] == 'Reply to hello from ' + incident['title']
+        assert reopened[3]['content'] == 'follow up from ' + incident['title']
+        assert reopened[4]['content'] == 'Reply to follow up from ' + incident['title']
         assert not any('progress' in m.get('type', '') for m in reopened)
         assert web.incident_store.get(incident['id']).status == 'NEW'
-    agent.assert_not_called()
+    assert agent.await_count == 4
     procedure.assert_not_called()
 
 
