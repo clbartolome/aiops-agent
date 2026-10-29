@@ -78,7 +78,8 @@ async def request_user_input(question: str) -> str:
     return question
 
 
-async def run_agent(message: str, config: Config, session: Session | None = None) -> str:
+async def run_agent(message: str, config: Config, session: Session | None = None,
+                    *, input_persisted: bool = False) -> str:
     operational = requires_live_data(message)
     secrets = (config.model_api_key, *(server.token for server in config.mcp_servers))
     logger.info("Model=%s provider_host=%s", config.model_name, urlsplit(config.model_base_url).hostname)
@@ -119,7 +120,9 @@ async def run_agent(message: str, config: Config, session: Session | None = None
             raise
         logger.info("Agent tools exposed count=%d names=%s", len(tools), [tool.name for tool in tools])
         retrying = False
-        run_input = message
+        # Accepted web input is already in SDK history. Empty new input keeps
+        # the model context identical while avoiding a second user-row write.
+        run_input = [] if session is not None and input_persisted else message
         try:
             for pass_index in range(2):
                 result = await Runner.run(

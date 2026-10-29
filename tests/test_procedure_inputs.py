@@ -21,7 +21,7 @@ from mcp.types import CallToolResult, TextContent
 import app.procedure as procedure_module
 from app.procedure import handle_cancel, handle_procedure, handle_procedure_input_reply
 from app.procedure.models import ProcedureContext, StepResult
-from tests.conftest import drain_procedure_events, message_texts
+from tests.conftest import prepare_and_approve, drain_procedure_events, message_texts
 
 # A single required input, no default.
 KB_SINGLE_INPUT = """# Inspect namespace health
@@ -175,13 +175,14 @@ def make_context(kb_content: str, inputs: dict | None = None, status: str = "COL
     from app.procedure.parser import parse_procedure
     procedure = parse_procedure(kb_content)
     return ProcedureContext(
+        confirmed=True,
         run_id=run_id, original_request="", kb_title=procedure.title, kb_content=kb_content,
         procedure=procedure, inputs=inputs or {}, status=status,
     )
 
 
 def run_procedure(message, config):
-    return asyncio.run(drain_procedure_events(handle_procedure(message, config)))
+    return asyncio.run(prepare_and_approve(message, config))
 
 
 def run_reply(message, context, config):

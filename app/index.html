@@ -8,12 +8,27 @@
     :root { color-scheme: dark; font: 16px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
     * { box-sizing: border-box; }
     body { margin: 0; background: #101214; color: #e2e5e9; }
-    main { max-width: 1100px; min-height: 100dvh; margin: auto; padding: 28px 24px; }
-    .layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 24px; }
+    main { max-width: 1800px; min-height: 100dvh; margin: auto; padding: 28px 24px; }
+    .layout { display: grid; grid-template-columns: minmax(280px, 300px) minmax(0, 1fr) minmax(300px, 320px); gap: 24px; }
     aside { border-right: 1px solid #353a40; padding-right: 16px; }
-    #sessions button { display: block; width: 100%; text-align: left; margin-top: 8px; overflow-wrap: anywhere; }
+    .sidebar-row { display: flex; align-items: center; gap: 5px; margin-top: 8px; min-width: 0; }
+    .context-select { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;
+      text-align: left; font-size: 13px; line-height: 1.6; padding: 8px 10px; }
+    .sidebar-copy { flex: 1; min-width: 0; }
+    .sidebar-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+      line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+    .sidebar-state { flex-shrink: 0; display: inline-flex; align-items: center; width: 12px; }
+    .unread-indicator { color: #facc15; font-size: 14px; line-height: 1; }
+    .processing-loader { width: 12px; height: 12px; border: 2px solid #505962;
+      border-top-color: #d5dce5; border-radius: 50%; animation: sidebar-spin .85s linear infinite; }
+    @keyframes sidebar-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { .processing-loader { animation-duration: 2s; } }
+    .delete-context { flex-shrink: 0; width: 24px; height: 28px; padding: 0; border: 0;
+      opacity: 0; font-size: 16px; }
+    .sidebar-row:hover .delete-context, .sidebar-row:focus-within .delete-context { opacity: 1; }
+    .delete-context:hover { color: #ffb1a8; }
+    @media (hover: none) { .delete-context { opacity: 1; } }
     #sessions button[aria-current="true"] { color: #8cd8b1; border-color: #8cd8b1; }
-    @media (max-width: 600px) { .layout { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #353a40; padding-bottom: 12px; } }
     header { padding-bottom: 16px; border-bottom: 1px solid #353a40; }
     h1 { font: inherit; font-weight: bold; margin: 0; }
     .hint { color: #9ba4af; font-size: 13px; margin: 4px 0 0; }
@@ -42,6 +57,23 @@
     button:focus-visible { outline: 2px solid #8cd8b1; }
     button:disabled { cursor: wait; opacity: .5; }
     #status { min-height: 24px; }
+    #procedure-confirmation { display: flex; gap: 10px; margin-bottom: 16px; }
+    #procedure-confirmation:empty { display: none; }
+    .confirm-run { color: #101214; background: #8cd8b1; border-color: #8cd8b1; }
+    .confirm-cancel:hover { color: #ffb1a8; border-color: #ffb1a8; }
+
+    .incidents-panel { border-right: 0; border-left: 1px solid #353a40; padding: 0 0 0 16px; font-size: 13px; }
+    .severity-critical { --incident-accent: #ef8f8f; }
+    .severity-warning { --incident-accent: #d8af69; }
+    .severity-info { --incident-accent: #8caed8; }
+    .incident-item { border: 0; border-left: 2px solid var(--incident-accent); }
+    .incident-item[aria-current="true"] { background: #23272c; color: var(--incident-accent); }
+    .incident-meta, .incident-label { color: var(--incident-accent); font-size: 11px; }
+    .message.incident { border-left: 3px solid var(--incident-accent); padding: 8px 12px; background: #171a1e; }
+    .incident-title { font-weight: bold; margin: 8px 0; }
+    .incident-body { white-space: pre-wrap; }
+    @media (max-width: 1200px) { .layout { align-content: start; grid-template-columns: minmax(220px, 260px) minmax(0, 1fr); } .incidents-panel { grid-column: 1 / -1; border-left: 0; border-top: 1px solid #353a40; padding: 12px 0; } }
+    @media (max-width: 700px) { main { padding: 20px 16px; } .layout { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #353a40; padding: 0 0 12px; } }
 
     /* /procedure mode: a small, consistent accent — not a redesign of the input. */
     .procedure-chip { display: inline-flex; align-items: center; flex-shrink: 0;
@@ -76,6 +108,7 @@
       <p class="hint">Enter to send · Conversation context is retained</p>
     </header>
     <section id="history" role="log" aria-label="Conversation" aria-live="polite"></section>
+    <div id="procedure-confirmation" aria-label="Procedure confirmation"></div>
     <form id="chat">
       <label for="message" aria-label="Your message">&gt;</label>
       <span id="procedure-chip" class="procedure-chip" hidden>PROCEDURE</span>
@@ -84,10 +117,16 @@
     </form>
     <p id="status" class="hint" role="status"></p>
     </div>
+    <aside class="incidents-panel" aria-label="Incidents">
+      <h1>Incidents</h1>
+      <p id="incident-status" class="hint" role="status"></p>
+      <nav id="incidents" aria-label="Incident inbox"></nav>
+    </aside>
   </main>
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
   <script>
+    const confirmationControls = document.querySelector('#procedure-confirmation');
     const form = document.querySelector('#chat');
     const input = document.querySelector('#message');
     const button = form.querySelector('button');
@@ -97,8 +136,13 @@
 
     const sessionList = document.querySelector('#sessions');
     const newButton = document.querySelector('#new-session');
-    let selectedSession = null;
-    let busy = false;
+    let activeContext = null;
+    const sessionStates = new Map();
+    let selectionVersion = 0;
+    let loadedRevision = null;
+    let historyRequestVersion = 0;
+    let minimumHistoryRevision = 0;
+    let loadingContext = false;
 
     // Deterministic /procedure routing mirrors the backend: only the literal
     // "/procedure" prefix (followed by whitespace or the end of input) activates
@@ -127,7 +171,7 @@
     }
 
     input.addEventListener('input', () => {
-      if (procedureMode) return;
+      if (procedureMode || activeContext?.type === 'incident') return;
       const match = input.value.match(/^\/procedure\s(.*)$/s);
       if (match) enterProcedureMode(match[1]);
     });
@@ -141,16 +185,95 @@
 
     async function api(path, options) {
       const response = await fetch(path, options);
-      const data = await response.json();
+      const data = response.status === 204 ? null : await response.json();
       if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
       return data;
     }
 
-    function setBusy(value) {
-      busy = value;
-      form.hidden = value || !selectedSession;
-      newButton.disabled = value;
-      for (const entry of sessionList.querySelectorAll('button')) entry.disabled = value;
+    function updateComposer() {
+      form.hidden = !activeContext;
+      button.disabled = loadingContext || !!sessionStates.get(activeContext?.sessionId)?.processing;
+      input.disabled = button.disabled;
+      renderConfirmation();
+    }
+    function renderConfirmation() {
+      confirmationControls.replaceChildren();
+      const owner = activeContext;
+      const state = sessionStates.get(owner?.sessionId);
+      if (!owner || loadingContext || state?.processing || !state?.confirmation) return;
+      const runId = state.confirmation.run_id;
+      for (const [action, label, className] of [
+        ['approve', 'Run procedure', 'confirm-run'], ['cancel', 'Cancel', 'confirm-cancel'],
+      ]) {
+        const control = document.createElement('button');
+        control.type = 'button';
+        control.className = className;
+        control.textContent = label;
+        control.addEventListener('click', () => sendSessionRequest(owner,
+          `/api/sessions/${owner.sessionId}/procedure-confirmation`, {run_id: runId, action}));
+        confirmationControls.append(control);
+      }
+    }
+
+    // State precedence: processing always wins; selected items suppress unread.
+    function indicator(state, selected) {
+      const slot = document.createElement('span');
+      slot.className = 'sidebar-state';
+      if (state?.processing) {
+        slot.className += ' processing-loader';
+        slot.setAttribute('role', 'img');
+        slot.setAttribute('aria-label', 'Processing');
+      } else if (state?.unread && !selected) {
+        slot.className += ' unread-indicator';
+        slot.textContent = '●';
+        slot.setAttribute('role', 'img');
+        slot.setAttribute('aria-label', 'Unread update');
+      }
+      return slot;
+    }
+    function sidebarRow(entry, context, processing) {
+      const row = document.createElement('div');
+      row.className = 'sidebar-row';
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'delete-context';
+      remove.textContent = '×';
+      remove.setAttribute('aria-label', context.type === 'incident' ? 'Delete incident' : 'Delete conversation');
+      remove.title = processing ? 'Cannot delete while processing' : 'Delete';
+      remove.disabled = !!processing;
+      remove.addEventListener('click', () => deleteContext(context));
+      row.append(entry, remove);
+      return row;
+    }
+    async function deleteContext(context) {
+      const kind = context.type === 'incident' ? 'incident' : 'conversation';
+      if (!window.confirm(`Delete this ${kind}?`)) return;
+      try {
+        const path = context.type === 'incident' ? `/api/incidents/${context.id}` : `/api/sessions/${context.sessionId}`;
+        const accepted = await api(path, {method: 'DELETE'});
+        sessionStates.delete(context.sessionId);
+        const wasSelected = activeContext?.sessionId === context.sessionId;
+        if (wasSelected) {
+          ++selectionVersion;
+          activeContext = null;
+          loadedRevision = null;
+          loadingContext = false;
+          procedureAwaitingInput = false;
+          procedureProgress.hide();
+          history.replaceChildren();
+          input.value = '';
+          exitProcedureMode();
+          status.textContent = '';
+          updateComposer();
+        }
+        const sessions = await refreshSessions();
+        await refreshIncidents();
+        // Respect any navigation which occurred during the delete request.
+        if (wasSelected && !activeContext && sessions.length) await selectSession(sessions[0].session_id);
+      } catch (error) { window.alert(error.message); }
+    }
+    function rememberState(id, state) {
+      sessionStates.set(id, state);
     }
 
     async function refreshSessions() {
@@ -158,75 +281,170 @@
       sessionList.replaceChildren();
       for (const session of sessions) {
         const entry = document.createElement('button');
-        entry.textContent = session.title;
-        entry.setAttribute('aria-current', String(session.session_id === selectedSession));
-        entry.disabled = busy;
+        rememberState(session.session_id, session);
+        entry.className = 'context-select';
+        entry.title = session.title;
+        const title = document.createElement('span');
+        title.className = 'sidebar-copy sidebar-title';
+        title.textContent = session.title;
+        entry.append(title, indicator(session, activeContext?.sessionId === session.session_id));
+        entry.dataset.sessionId = session.session_id;
+        entry.setAttribute('aria-current', String(activeContext?.type === 'conversation' && session.session_id === activeContext.sessionId));
         entry.addEventListener('click', () => selectSession(session.session_id));
-        sessionList.append(entry);
+        sessionList.append(sidebarRow(entry, {type: 'conversation', id: session.session_id, sessionId: session.session_id}, session.processing));
       }
       return sessions;
     }
 
+    function updateSelection() {
+      for (const entry of sessionList.querySelectorAll('.context-select')) {
+        const selected = activeContext?.type === 'conversation' && entry.dataset.sessionId === activeContext.sessionId;
+        entry.setAttribute('aria-current', String(selected));
+        entry.lastElementChild.replaceWith(indicator(sessionStates.get(entry.dataset.sessionId), selected));
+      }
+      for (const entry of incidentList.querySelectorAll('.context-select')) {
+        const selected = activeContext?.type === 'incident' && entry.dataset.incidentId === activeContext.id;
+        entry.setAttribute('aria-current', String(selected));
+        entry.lastElementChild.replaceWith(indicator(sessionStates.get(entry.dataset.sessionId), selected));
+      }
+    }
+
     async function selectSession(id) {
-      if (busy) return;
-      setBusy(true);
-      // The active session and its rendered history are switched together,
-      // immediately -- never left showing the *previous* session's messages
-      // under the *new* session's identity while its own history loads.
-      selectedSession = id;
+      return selectContext({ type: 'conversation', id, sessionId: id });
+    }
+
+    async function loadActive(context, version) {
+      const requestVersion = ++historyRequestVersion;
+      const session = await api(`/api/sessions/${context.sessionId}`);
+      if (version !== selectionVersion || activeContext?.sessionId !== context.sessionId
+          || requestVersion !== historyRequestVersion
+          || session.revision < minimumHistoryRevision
+          || (loadedRevision !== null && session.revision < loadedRevision)) return;
+      rememberState(context.sessionId, session);
+      procedureProgress.hide();
+      history.replaceChildren();
+      for (const message of session.messages) renderStoredMessage(message);
+      loadedRevision = session.revision;
+      procedureAwaitingInput = session.awaiting_input;
+      if (session.processing && session.progress) procedureProgress.show(session.progress);
+      status.textContent = '';
+      updateComposer();
+      await api(`/api/sessions/${context.sessionId}/read`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({revision: session.revision}),
+      });
+    }
+
+    async function selectContext(context) {
+      const version = ++selectionVersion;
+      activeContext = context;
+      updateSelection();
+      procedureProgress.hide();
       procedureAwaitingInput = false;
       history.replaceChildren();
+      loadedRevision = null;
+      minimumHistoryRevision = 0;
+      ++historyRequestVersion;
       input.value = '';
+      exitProcedureMode();
+      loadingContext = true;
+      updateComposer();
       status.textContent = 'Loading conversation...';
       try {
-        const session = await api(`/api/sessions/${id}`);
-        for (const message of session.messages) renderStoredMessage(message);
+        await loadActive(context, version);
         await refreshSessions();
-        status.textContent = '';
+        await refreshIncidents();
       } catch (error) {
-        // Loading failed: show nothing rather than stale/foreign messages.
-        history.replaceChildren();
-        status.textContent = 'Unable to load this conversation.';
+        if (version === selectionVersion) status.textContent = 'Unable to load this conversation.';
       } finally {
-        setBusy(false);
-        input.focus();
+        if (version === selectionVersion) {
+          loadingContext = false;
+          updateComposer();
+          input.focus();
+        }
       }
     }
 
     async function newSession() {
-      if (busy) return;
-      setBusy(true);
       try {
         const session = await api('/api/sessions', { method: 'POST' });
-        selectedSession = session.session_id;
-        procedureAwaitingInput = false;
-        history.replaceChildren();
-        input.value = '';
-        await refreshSessions();
-        status.textContent = '';
-      } catch (error) {
-        status.textContent = `Error: ${error.message}`;
-      } finally {
-        setBusy(false);
-        input.focus();
-      }
+        await selectSession(session.session_id);
+      } catch (error) { status.textContent = `Error: ${error.message}`; }
     }
 
     newButton.addEventListener('click', newSession);
 
     async function initialize() {
-      setBusy(true);
       try {
         const sessions = await refreshSessions();
-        setBusy(false);
         if (sessions.length) await selectSession(sessions[0].session_id);
         else await newSession();
       } catch (error) {
         status.textContent = `Error: ${error.message}`;
-        setBusy(false);
       }
     }
-    initialize();
+
+
+    const incidentList = document.querySelector('#incidents');
+    const incidentStatus = document.querySelector('#incident-status');
+    function appendIncident(incident) {
+      if (history.querySelector(`[data-incident-id="${incident.id}"]`)) return;
+      const line = document.createElement('div');
+      line.className = `message incident severity-${incident.severity}`;
+      line.dataset.incidentId = incident.id;
+      const label = document.createElement('div');
+      label.className = 'incident-label';
+      label.textContent = `INCIDENT · ${incident.severity.toUpperCase()}`;
+      const title = document.createElement('div');
+      title.className = 'incident-title';
+      title.textContent = incident.title;
+      const body = document.createElement('div');
+      body.className = 'incident-body';
+      body.textContent = incident.message;
+      line.append(label, title, body);
+      history.append(line);
+    }
+    async function openIncident(id) {
+      const version = ++selectionVersion;
+      try {
+        const incident = await api(`/api/incidents/${encodeURIComponent(id)}`);
+        if (version !== selectionVersion) return;
+        await selectContext({ type: 'incident', id, sessionId: incident.session_id });
+        incidentStatus.textContent = '';
+      } catch (error) { incidentStatus.textContent = `Error: ${error.message}`; }
+
+    }
+    async function refreshIncidents() {
+      try {
+        const incidents = await api('/api/incidents');
+        incidentList.replaceChildren();
+        for (const incident of incidents) {
+          const entry = document.createElement('button');
+          entry.type = 'button';
+          entry.className = `context-select incident-item severity-${incident.severity}`;
+          entry.dataset.incidentId = incident.id;
+          entry.dataset.sessionId = incident.session_id;
+          const title = document.createElement('div');
+          rememberState(incident.session_id, incident);
+          title.className = 'sidebar-title';
+          title.textContent = incident.title;
+          entry.title = incident.title;
+          const meta = document.createElement('div');
+          meta.className = 'incident-meta';
+          meta.textContent = `${incident.severity} · ${new Date(incident.created_at).toLocaleString()}`;
+          const copy = document.createElement('span');
+          copy.className = 'sidebar-copy';
+          copy.append(title, meta);
+          entry.append(copy, indicator(incident, activeContext?.sessionId === incident.session_id));
+          entry.addEventListener('click', () => openIncident(incident.id));
+          incidentList.append(sidebarRow(entry, {type: 'incident', id: incident.id, sessionId: incident.session_id}, incident.processing));
+        }
+        updateSelection();
+        incidentStatus.textContent = incidents.length ? '' : 'No incidents yet.';
+      } catch { incidentStatus.textContent = 'Unable to refresh incidents. Retrying…'; }
+
+    }
+
 
     function renderMarkdown(text) {
       const html = marked.parse(text, { gfm: true, breaks: true });
@@ -269,7 +487,11 @@
     // everything else (including procedure KB/step/summary output, which
     // is persisted as plain assistant messages) is just a normal message.
     function renderStoredMessage(message) {
-      if (message.role === 'user') {
+      if (message.type === 'incident') {
+        if (message.incident) appendIncident(message.incident);
+        return;
+      }
+      if (message.role === 'user' && activeContext?.type === 'conversation') {
         const match = message.content.match(PROCEDURE_PATTERN);
         if (match) {
           appendProcedureMessage((match[2] || '').trim());
@@ -372,64 +594,66 @@
       if (buffer.trim()) handleProcedureEvent(JSON.parse(buffer));
     }
 
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const rawInput = input.value;
-      const message = (procedureMode ? `/procedure ${rawInput}` : rawInput).trim();
-      if (!message || busy || !selectedSession) return;
-      const sessionId = selectedSession;
-      const isProcedure = PROCEDURE_PATTERN.test(message);
-      const procedureQuery = isProcedure ? (message.match(PROCEDURE_PATTERN)[2] || '').trim() : '';
-      // A plain reply while a procedure is waiting on input is still a
-      // normal-looking chat message; the backend's active-procedure session
-      // state (not this flag) is what actually routes it to the procedure.
-      const isProcedureReply = !isProcedure && procedureAwaitingInput;
-
-      if (isProcedure) appendProcedureMessage(procedureQuery);
-      else appendMessage(message, 'user');
+    async function sendSessionRequest(owner, path, payload) {
+      if (!owner || activeContext?.sessionId !== owner.sessionId || loadingContext
+          || sessionStates.get(owner.sessionId)?.processing) return;
+      const version = selectionVersion;
+      ++historyRequestVersion;
+      rememberState(owner.sessionId, {processing: true});
+      updateComposer();
       input.value = '';
       exitProcedureMode();
-      setBusy(true);
-      status.textContent = (isProcedure || isProcedureReply) ? '' : 'Working…';
-
-      // An empty "/procedure" needs no MCP call, so no loading state is shown.
-      if (isProcedure && procedureQuery) procedureProgress.show('Searching KB');
-      else if (isProcedureReply) procedureProgress.show('Extracting parameters');
-
       try {
-        const response = await fetch(`/api/sessions/${sessionId}/messages`, {
+        const accepted = await api(path, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message }),
+          headers: {'Content-Type': 'application/json', 'Prefer': 'respond-async'},
+          body: JSON.stringify(payload),
         });
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType.includes('application/x-ndjson')) {
-          if (!response.ok) {
-            throw new Error('The request could not be processed.');
-          }
-          // A /procedure command (or a reply while one is waiting on
-          // input) streams progress/message events live as the backend
-          // produces them -- see readProcedureStream.
-          await readProcedureStream(response);
-        } else {
-          const data = await response.json();
-          if (!response.ok) {
-            throw new Error(typeof data.detail === 'string' ? data.detail : 'The request could not be processed.');
-          }
-          procedureProgress.hide();
-          appendMessage(data.response, 'assistant');
-          procedureAwaitingInput = false;
+        if (version === selectionVersion) {
+          minimumHistoryRevision = Math.max(minimumHistoryRevision, accepted.revision);
+          ++historyRequestVersion;
+          await loadActive(owner, version);
         }
         await refreshSessions();
+        await refreshIncidents();
       } catch (error) {
-        procedureProgress.hide();
-        appendMessage(`Error: ${error.message}`, 'error');
+        // Transport errors belong only to the view which submitted the message.
+        if (version === selectionVersion) status.textContent = `Error: ${error.message}`;
       } finally {
-        setBusy(false);
-        status.textContent = '';
-        input.focus();
+        if (version === selectionVersion) updateComposer();
       }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = (procedureMode ? `/procedure ${input.value}` : input.value).trim();
+      const owner = activeContext;
+      if (!message || !owner) return;
+      await sendSessionRequest(owner, `/api/sessions/${owner.sessionId}/messages`, {message});
     });
+
+    async function pollContexts() {
+      try {
+        await Promise.all([refreshSessions(), refreshIncidents()]);
+        const owner = activeContext;
+        const version = selectionVersion;
+        if (owner && !loadingContext) {
+          const state = await api(`/api/sessions/${owner.sessionId}/state`);
+          if (version === selectionVersion) {
+            rememberState(owner.sessionId, state);
+            if (loadedRevision !== state.revision) await loadActive(owner, version);
+            else {
+              procedureProgress.hide();
+              if (state.processing && state.progress) procedureProgress.show(state.progress);
+            }
+            updateComposer();
+          }
+        }
+      } catch { /* Retry without replacing another context's messages. */ }
+      setTimeout(pollContexts, 1000);
+    }
+    initialize();
+    pollContexts();
   </script>
 </body>
 </html>

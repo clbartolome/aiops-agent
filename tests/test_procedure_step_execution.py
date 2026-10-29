@@ -33,7 +33,7 @@ from mcp.types import CallToolResult, TextContent
 import app.procedure as procedure_module
 from app.procedure import handle_procedure, handle_procedure_input_reply
 from app.procedure.models import ProcedureContext, StepResult
-from tests.conftest import drain_procedure_events, event_types, message_texts, progress_texts
+from tests.conftest import prepare_and_approve, drain_procedure_events, event_types, message_texts, progress_texts
 
 # A four-step procedure (mirrors the manual acceptance scenario).
 KB_FOUR_STEPS = """# Inspect namespace health
@@ -151,6 +151,7 @@ def make_ready_context(run_id="run-1") -> ProcedureContext:
 
     procedure = parse_procedure(KB_FOUR_STEPS)
     return ProcedureContext(
+        confirmed=True,
         run_id=run_id, original_request="inspect namespace health for namespace payments",
         kb_title=procedure.title, kb_content=KB_FOUR_STEPS, procedure=procedure,
         inputs={"namespace": "payments"}, status="READY",
@@ -162,7 +163,7 @@ def executed_step_ids(step_executor) -> list[str]:
 
 
 def run_procedure(message, config):
-    return asyncio.run(drain_procedure_events(handle_procedure(message, config)))
+    return asyncio.run(prepare_and_approve(message, config))
 
 
 def run_reply(message, context, config):
@@ -204,7 +205,7 @@ def test_full_sequence_from_a_fresh_procedure_request(config, itsm_mcp, extracto
     messages = message_texts(events)
     assert messages == [
         "KB found: Inspect namespace health",
-        "Procedure loaded: 4 steps.",
+        "Procedure found: Inspect namespace health\n\nSteps: 4\nRisk: low\n\nDo you want to run this procedure?",
         "Using Namespace: payments.",
         "Namespace payments exists.",
         "Found 8 pods in namespace payments.",
@@ -269,6 +270,7 @@ def test_each_step_result_is_revealed_before_the_next_steps_progress(config, ste
     )
     procedure = parse_procedure(two_step_kb)
     context = ProcedureContext(
+        confirmed=True,
         run_id="run-1", original_request="", kb_title=procedure.title, kb_content=two_step_kb,
         procedure=procedure, inputs={"namespace": "payments"}, status="READY",
     )
@@ -429,6 +431,7 @@ Done.
 """
     procedure = parse_procedure(single_step_kb)
     context = ProcedureContext(
+        confirmed=True,
         run_id="run-1", original_request="", kb_title=procedure.title, kb_content=single_step_kb,
         procedure=procedure, inputs={}, status="READY",
     )
@@ -571,6 +574,7 @@ def test_no_extraction_progress_for_the_deterministic_single_field_shortcut(conf
 
     procedure = parse_procedure(KB_FOUR_STEPS)
     context = ProcedureContext(
+        confirmed=True,
         run_id="run-1", original_request="inspect namespace health", kb_title=procedure.title,
         kb_content=KB_FOUR_STEPS, procedure=procedure, inputs={}, status="COLLECTING_INPUTS",
     )

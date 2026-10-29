@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local incident persistence
+data/incidents.sqlite3*
+data/sessions.sqlite3*

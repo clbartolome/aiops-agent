@@ -29,7 +29,9 @@ def test_creation_listing_and_unknown_session():
             a, b = first.json(), second.json()
             assert UUID(a['session_id']) != UUID(b['session_id'])
             assert set(a) == {'session_id', 'title', 'created_at', 'updated_at'}
-            assert (await client.get('/api/sessions')).json() == [a, b]
+            listed = (await client.get('/api/sessions')).json()
+            assert [{key: item[key] for key in a} for item in listed] == [a, b]
+            assert all(not item['processing'] and not item['unread'] for item in listed)
             assert (await client.get('/api/sessions/' + a['session_id'])).json()['messages'] == []
             assert (await client.post('/api/sessions/missing/messages', json={'message': 'hello'})).status_code == 404
             assert (await client.get('/api/sessions/missing')).status_code == 404
@@ -42,9 +44,9 @@ def test_multiturn_mcp_and_switching(model, mcp_boundary, monkeypatch):
     original = web.run_agent
     used_sessions = []
 
-    async def tracked(message, config, session):
+    async def tracked(message, config, session, *, input_persisted=False):
         used_sessions.append(session)
-        return await original(message, config, session=session)
+        return await original(message, config, session=session, input_persisted=input_persisted)
 
     monkeypatch.setattr(web, 'run_agent', tracked)
 
@@ -102,8 +104,10 @@ def test_rejected_answer_does_not_leak_into_history(model):
             result = await client.post(path + '/messages', json={'message': 'Count pods in production'})
             assert result.json()['response'] == NO_LIVE_DATA
             history = await client.get(path)
-            assert '999' not in history.text and 'secret-namespace' not in history.text
-            assert history.json()['messages'][-1]['content'] == NO_LIVE_DATA
+            messages = history.json()['messages']
+            assert all('999' not in item['content'] and 'secret-namespace' not in item['content']
+                       for item in messages)
+            assert messages[-1]['content'] == NO_LIVE_DATA
     asyncio.run(scenario())
 
 
@@ -113,13 +117,14 @@ def test_same_session_requests_are_serialized(monkeypatch):
         active = 0
         calls = 0
 
-        async def run(message, config, session):
+        async def run(message, config, session, *, input_persisted=False):
             nonlocal active, calls
             active += 1
             calls += 1
             assert active == 1
             started.set()
             await release.wait()
+            await session.add_items([{'role': 'assistant', 'content': 'Done ' + message}])
             active -= 1
             return 'Done'
 
@@ -135,6 +140,9 @@ def test_same_session_requests_are_serialized(monkeypatch):
             release.set()
             assert all(response.status_code == 200 for response in await asyncio.gather(first, second))
             assert calls == 2
+            assert [item['content'] for item in (await client.get(
+                '/api/sessions/' + session_id,
+            )).json()['messages']] == ['one', 'Done one', 'two', 'Done two']
     asyncio.run(scenario())
 
 
@@ -285,7 +293,9 @@ def test_cancel_confirmation_is_persisted(monkeypatch):
 
 
 @pytest.mark.parametrize('outcome', ['success', 'failure', 'skipped', 'protocol_error'])
-def test_live_tool_retry_is_internal_and_preserves_history(model, config, mcp_boundary, outcome):
+@pytest.mark.parametrize('input_persisted', [False, True])
+def test_live_tool_retry_is_internal_and_preserves_history(
+        model, config, mcp_boundary, outcome, input_persisted):
     from app.agent import LIVE_TOOL_RETRY_INSTRUCTIONS, INVALID_MODEL_OUTPUT, run_agent
     from app.diagnostics import ProtocolTextError
     from app.sessions import visible_messages
@@ -317,7 +327,9 @@ def test_live_tool_retry_is_internal_and_preserves_history(model, config, mcp_bo
             await session.add_items([{'role': 'user', 'content': 'Earlier general discussion'},
                                      {'role': 'assistant', 'content': 'Earlier answer'}])
             message = 'how many pods are in openshift-mcp namespace?'
-            result = await run_agent(message, config, session=session)
+            if input_persisted:
+                await session.add_items([{'role': 'user', 'content': message}])
+            result = await run_agent(message, config, session=session, input_persisted=input_persisted)
             expected = (final_answer if outcome == 'success' else
                         INVALID_MODEL_OUTPUT if outcome == 'protocol_error' else NO_LIVE_DATA)
             assert result == expected

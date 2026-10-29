@@ -143,7 +143,7 @@ def test_page_hides_progress_on_every_terminal_path(agent):
     page = request("GET", "/").text
     assert "procedureProgress.hide();\n        appendMessage(data.message, 'assistant');" in page
     assert "procedureProgress.hide();\n        procedureAwaitingInput = data.state === 'collecting_inputs';" in page
-    assert "procedureProgress.hide();\n        appendMessage(`Error: ${error.message}`, 'error');" in page
+    assert "if (version === selectionVersion) status.textContent = `Error: ${error.message}`;" in page
 
 
 def test_page_does_not_fake_progress_with_a_frontend_timer(agent):
@@ -159,13 +159,13 @@ def test_page_tracks_procedure_awaiting_input_across_replies(agent):
     # progress bubble too, and the flag is recomputed from the response
     # state (never assumed) after every request.
     assert "let procedureAwaitingInput = false;" in page
-    assert "const isProcedureReply = !isProcedure && procedureAwaitingInput;" in page
-    assert "else if (isProcedureReply) procedureProgress.show('Extracting parameters');" in page
+    assert "procedureAwaitingInput = session.awaiting_input;" in page
+    assert "if (session.processing && session.progress) procedureProgress.show(session.progress);" in page
 
 
 def test_page_skips_progress_for_empty_procedure_command(agent):
     page = request("GET", "/").text
-    assert "if (isProcedure && procedureQuery) procedureProgress.show('Searching KB');" in page
+    assert "if (session.processing && session.progress) procedureProgress.show(session.progress);" in page
 
 
 # --- Session message persistence/restoration (frontend) ---------------------
@@ -181,7 +181,7 @@ def test_page_switches_active_session_and_clears_history_before_fetching(agent):
     """
     page = request("GET", "/").text
     assert (
-        "selectedSession = id;\n      procedureAwaitingInput = false;\n      history.replaceChildren();" in page
+        "activeContext = context;\n      updateSelection();\n      procedureProgress.hide();\n      procedureAwaitingInput = false;\n      history.replaceChildren();" in page
     )
     assert "status.textContent = 'Loading conversation...';" in page
 
@@ -198,7 +198,7 @@ def test_page_shows_controlled_error_and_clears_stale_messages_on_load_failure(a
     """
     page = request("GET", "/").text
     assert (
-        "history.replaceChildren();\n        status.textContent = 'Unable to load this conversation.';" in page
+        "if (version === selectionVersion) status.textContent = 'Unable to load this conversation.';" in page
     )
 
 
@@ -366,6 +366,7 @@ def make_procedure_context(status="COLLECTING_INPUTS", inputs=None):
         inputs=[], steps=[{"id": "step-1", "title": "Step 1", "instruction": "Do it."}],
     )
     return ProcedureContext(
+        confirmed=True,
         run_id="run-1", original_request="inspect namespace health", kb_title="Inspect namespace health",
         kb_content="# Inspect namespace health\n", procedure=procedure, inputs=inputs or {}, status=status,
     )
@@ -606,6 +607,7 @@ Done.
     # declares no required inputs, so that function settles straight to
     # READY/RUNNING internally regardless of this stored status.
     context = ProcedureContext(
+        confirmed=True,
         run_id="run-1", original_request="", kb_title=procedure.title, kb_content=single_step_kb,
         procedure=procedure, inputs={}, status="COLLECTING_INPUTS",
     )
@@ -723,7 +725,7 @@ def test_terminal_procedure_clears_association_and_returns_to_chat(
     assert conversation.active_procedure is None
     response = request('POST', path, json={'message': 'hello'})
     assert response.json() == {'response': agent.return_value}
-    agent.assert_awaited_once_with('hello', config, session=conversation.session)
+    agent.assert_awaited_once_with('hello', config, session=conversation.session, input_persisted=True)
     procedure_lifecycle.reply.assert_not_called()
     assert f'session={conversation.session_id} route=procedure' in caplog.text
     assert f'session={conversation.session_id} route=operations_agent' in caplog.text
@@ -742,7 +744,7 @@ def test_waiting_procedure_in_another_session_does_not_intercept_chat(
     web.conversations[second.session_id] = second
     response = request('POST', f'/api/sessions/{second.session_id}/messages', json={'message': message})
     assert response.json() == {'response': agent.return_value}
-    agent.assert_awaited_once_with(message, config, session=second.session)
+    agent.assert_awaited_once_with(message, config, session=second.session, input_persisted=True)
     procedure_lifecycle.start.assert_not_called()
     procedure_lifecycle.reply.assert_not_called()
     assert first.active_procedure.status == 'COLLECTING_INPUTS'

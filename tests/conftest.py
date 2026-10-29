@@ -142,3 +142,25 @@ def mcp_boundary(monkeypatch):
     yield boundary
     assert all(server.session is None for server in boundary.servers)
     assert sorted(boundary.closed) == sorted(server.name for server in boundary.servers)
+
+
+@pytest.fixture(autouse=True)
+def durable_sessions(tmp_path, monkeypatch):
+    from app import web
+    from app.sessions import SessionStore
+    monkeypatch.setattr(web, 'session_store', SessionStore(tmp_path / 'sessions.sqlite3'))
+    monkeypatch.setattr(web, 'conversations', {})
+    yield
+    for conversation in web.conversations.values():
+        if hasattr(conversation.session, 'close'):
+            conversation.session.close()
+
+
+async def prepare_and_approve(message, config):
+    """Input/execution regressions explicitly approve before testing that phase."""
+    from app.procedure import handle_procedure, handle_procedure_confirmation
+    events, status = await drain_procedure_events(handle_procedure(message, config))
+    if status.state == 'waiting_for_confirmation':
+        continued, status = await drain_procedure_events(handle_procedure_confirmation('yes', status.context, config))
+        events += continued
+    return events, status
